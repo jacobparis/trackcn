@@ -3,8 +3,10 @@
 Clone individual files and directories from various GitHub repositories into your codebase, and pull upstream changes at any time.
 
 ```bash
-npx trackcn add vercel/ai/blob/main/AGENTS.md ./AGENTS.md
+npx trackcn add shadcn-ui/ui/blob/main/apps/v4/registry/new-york-v4/ui/button.tsx ./components/ui/button.tsx
 ```
+
+That's a shadcn component that can still receive updates. Copy-and-own always had a missing half — the moment you customize a file, you're cut off from upstream fixes. trackcn closes the loop: `trackcn pull` applies upstream *diffs* over your version, and collisions become merge markers your agent resolves.
 
 ## Use-cases
 
