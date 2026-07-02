@@ -3,10 +3,10 @@
 Clone individual files and directories from various GitHub repositories into your codebase, and pull upstream changes at any time.
 
 ```bash
-npx trackcn add shadcn-ui/ui/blob/main/apps/v4/registry/new-york-v4/ui/button.tsx ./components/ui/button.tsx
+npx trackcn add anthropics/skills/tree/main/skills ./.claude/skills
 ```
 
-That's a shadcn component that can still receive updates. Copy-and-own always had a missing half — the moment you customize a file, you're cut off from upstream fixes. trackcn closes the loop: `trackcn pull` applies upstream *diffs* over your version, and collisions become merge markers your agent resolves.
+That's Anthropic's skill library — updated weekly, and meant to be edited. Tune `frontend-design` to your design system; when upstream improves it, `trackcn pull` applies the upstream *diff* over your version, and collisions become merge markers your agent resolves.
 
 ## Use-cases
 
@@ -21,6 +21,16 @@ trackcn add mattpocock/skills/tree/main/skills ./.cursor/skills
 Skills are just markdown in GitHub directories — trackcn doesn't care which agent consumes them. Claude reads `./.claude/skills/`, Cursor reads `./.cursor/skills/`; track the same upstream into both, or track one and symlink the other.
 
 Use trackcn when you intend to **edit the skills you install** — a `design.md` you tune to your product, project best practices you extend — and still want upstream updates. Your edits are protected: updates arrive as merge markers, never overwrites. If a skill is pure documentation you'll never touch, a plain skill installer like skills.sh is all you need.
+
+### UI components
+
+Copy-and-own components, with the missing half — updates. shadcn's model cuts you off from upstream fixes the moment you customize a component; trackcn closes the loop:
+
+```bash
+trackcn add shadcn-ui/ui/blob/main/apps/v4/registry/new-york-v4/ui/button.tsx ./components/ui/button.tsx
+```
+
+Component updates are rare but valuable — accessibility fixes and new variants land on top of your customizations instead of forcing a manual diff.
 
 ### Single files
 
