@@ -15,48 +15,125 @@ That's Anthropic's skill library — updated weekly, and meant to be edited. Tun
 Install a skill library once, modify the skills to fit your project, and keep pulling upstream improvements without losing your edits:
 
 ```bash
-trackcn add mattpocock/skills/tree/main/skills ./.cursor/skills
+trackcn add mattpocock/skills/tree/main/skills ./.agents/skills
 ```
 
-Skills are just markdown in GitHub directories — trackcn doesn't care which agent consumes them. Claude reads `./.claude/skills/`, Cursor reads `./.cursor/skills/`; track the same upstream into both, or track one and symlink the other.
+Use trackcn when you intend to **edit the skills you install** — a `design.md` you tune to your product, project best practices you extend — and still want upstream updates. 
 
-Use trackcn when you intend to **edit the skills you install** — a `design.md` you tune to your product, project best practices you extend — and still want upstream updates. Your edits are protected: updates arrive as merge markers, never overwrites. If a skill is pure documentation you'll never touch, a plain skill installer like skills.sh is all you need.
+Many skills are essentially just documentation and shouldn't be edited by hand. If you're not going to modify it yourself, then you may prefer the skills.sh CLI which offers symlinking for you.
+
+### Design tokens
+
+Keep your project in sync with an upstream design system. Your designer can maintain one repository as the central source of tokens, such as a globals.css file from tweakcn.com.
+
+All of your other projects can track it and pull in changes as the tokens update.
+
+```
+trackcn add vercel/ai-chatbot/blob/main/app/globals.css ./app/globals.css
+```
 
 ### UI components
 
-Copy-and-own components, with the missing half — updates. shadcn's model cuts you off from upstream fixes the moment you customize a component; trackcn closes the loop:
+Pull components from GitHub, customize them heavily, and subscribe to changes when they update upstream.
 
-```bash
-trackcn add shadcn-ui/ui/blob/main/apps/v4/registry/new-york-v4/ui/button.tsx ./components/ui/button.tsx
+`shadcn` now has a GitHub Registries feature, which are a `registry.json` file in the root of the repo that describes where to find its components. `trackcn` has native support for these, and if you want to feature certain files, folders, or bundles to use with `trackcn`, you should use the exact same format.
+
+`trackcn` also supports GitHub Registries from private repositories, which the `shadcn` CLI currently does not
+
+```
+# List what a repository offers (reads its root registry.json)
+trackcn add jacobparis/trackcn
+
+# Install and track a curated item
+trackcn add jacobparis/trackcn/trackcn-skill
 ```
 
-Component updates are rare but valuable — accessibility fixes and new variants land on top of your customizations instead of forcing a manual diff.
+The official shadcn components don't actually update very often, so trackcn's update feature isn't a big win again the main registry. Instead, add components from another codebase directly. 
 
-### Single files
-
-Mirror a canonical file into every project that needs it:
-
-```bash
-trackcn add vercel/ai/blob/main/AGENTS.md ./AGENTS.md
+```
+trackcn add vercel/eve/tree/main/apps/templates/web-chat-next/components ./components
 ```
 
-Gists (`trackcn add https://gist.github.com/user/abc123`) and any raw `https://` URL work too.
+Live codebases work the best since they're maintained constantly. Alternatively, make a design template using https://ui.shadcn.com/create and treat that as your source of truth 
 
-### Directories
+#### trackcn vs shadcn 
 
-Track a maintainer-quality folder across every repository:
+The `shadcn` CLI contains a powerful registry system, with explicit support for import aliasing, design tokens, Tailwind config, and dependency installation. It's designed to guide you down the happy path and does a great job.
 
-```bash
-trackcn add vercel/ai/tree/main/.github/ISSUE_TEMPLATE ./.github/ISSUE_TEMPLATE
-```
+But when Tailwind 4 came out, shadcn users had to remain on Tailwind 3 until shadcn built in explicit support, updating the tooling to handle the new config and design tokens.
+
+This tool has the opposite philosophy: `trackcn add` will let you install ANYTHING, even with imports that reference non-existent files from upstream, because your agent can fix these after installation. It's your own responsibility to modify the code to work with your codebase.
 
 ### Templates
 
-Start from an upstream example without forking it. When upstream ships improvements, pull them into your modified copy:
+You can track both individual files and directories
 
 ```bash
-trackcn add vercel/next.js/tree/canary/examples/with-sentry .
+trackcn add owner/repo/tree/main/README.txt ./dest # this is a file
+trackcn add owner/repo/tree/main/components ./dest # this is a directory
+trackcn add owner/repo/tree/main/README.txt/ ./dest # this is a directory also 
 ```
+
+Templates are just big directories. Add a whole template repo to the root of your project and pull in updates even as you build out your product. 
+
+```
+trackcn add vercel/eve/tree/main/apps/templates/web-chat-next ./
+```
+
+## How do updates work 
+
+When you add code with trackcn, it's saved in a `trackcn.json` file with its current path in your project, with its source path in the upstream repo, and the upstream commit SHA.
+
+When you run `trackcn pull` it checks your local version against the upstream version at the specified commit.
+- If they're identical, you just get the latest version.
+- If they're not identical (because you made local changes) then we compute the diff range between the upstream file at your SHA and its latest version, which contains all future work done to that file that you don't have. 
+
+`trackcn` applies that diff over your local file with merge markers similar to what you'd get with a git merge conflict.
+
+AI models are very good at resolving these, and will take the spirit of the upstream changes and apply them thematically to your code. 
+
+You can ask your coding agent to run `trackcn pull` and it should be smart enough to figure it out end-to-end. There is no actual AI functionality in `trackcn` itself, it just combines the code with diffs in the right place to let your agent know what it needs to do.
+
+### Commits, commit ranges, and pull requests
+
+The above update feature is really just a specific case of applying the diff from a commit range to your codebase. You are free to do this directly
+
+Take a bug fix commit from one repository and apply to yours. Steal a whole feature by applying someone's PR to your project. 
+
+```bash
+trackcn add owner/repo/commit/abc1234              # one commit's changes
+trackcn add owner/repo/compare/v1.0...v2.0         # everything between two revisions
+trackcn add owner/repo/pull/42                     # a PR's changes; pull picks up new commits
+```
+
+If you `trackcn pull`, commits will do nothing since they're immutable. Pull Requests will update to the branch head though, so you can use this on work-in-progress branches.
+
+### Gists
+
+One way to package code for distribution via trackcn is via GitHub Gist. This will install every file in a gist at once.
+
+```
+trackcn add https://gist.github.com/jacobparis/447756a5b23554960db21c3f44825825
+```
+
+Gist doesn't support a directory structure, and you can't use `/` in the filename. They do support backslashes though, and so trackcn will correctly install a file name `app\components\button.tsx` to the `app/components` directory 
+
+Files with the .diff or .patch extension will be applied as diffs in the same way that commits and component updates are, resulting in diff merge markers on the target file. 
+
+Use this to ship a config change such as `package.json.patch`
+```patch
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -1,3 +1,6 @@
+ {
+-  "name": "test"
++  "name": "test",
++  "dependencies": {
++    "zod": "^3.0.0"
++  }
+ }
+ ```
 
 ### Registry bundles
 
@@ -84,19 +161,8 @@ Track only the lines you need from a source file:
 trackcn add owner/repo/blob/main/styles.css#L227-L300 ./styles/prose.css
 ```
 
-**Preview:** ranges re-slice on pull but are positional — they can't follow content that moves upstream.
+**Preview:** ranges re-slice on pull but are positional — they can't follow content that moves upstream. Use with caution
 
-### Commits, commit ranges, and pull requests
-
-Diffs are diffs. Apply a changeset directly instead of waiting for a release, or ship a reviewed feature twice — build it as a PR in one repo, apply it to the next:
-
-```bash
-trackcn add owner/repo/commit/abc1234              # one commit's changes
-trackcn add owner/repo/compare/v1.0...v2.0         # everything between two revisions
-trackcn add owner/repo/pull/42                     # a PR's changes; pull picks up new commits
-```
-
-**Preview:** commits are immutable (`pull` is a no-op); branch-head ranges and PRs update incrementally.
 
 ## How it works
 
@@ -128,13 +194,7 @@ If a file on disk still matches what trackcn last wrote, upstream changes apply 
 
 ## For agents
 
-trackcn ships a version-matched usage guide with the CLI:
-
-```bash
-trackcn skills get trackcn
-```
-
-Or install it as a skill so your agent knows the workflow before it ever runs a command:
+trackcn currently ships a version-matched usage guide with the CLI. Install it as a skill so your agent knows the workflow before it ever runs a command:
 
 ```bash
 trackcn add jacobparis/trackcn/trackcn-skill
@@ -150,7 +210,6 @@ trackcn pull [--dry-run] [--force]   Update installed files from their sources
 trackcn status [--json]              Check if files are up to date
 trackcn remove <url> [--hard]        Untrack a source (--hard deletes files)
 trackcn auth [login|status|logout]   Manage GitHub login
-trackcn skills [list|get|path]       Load version-matched usage guides for agents
 ```
 
 Shorthands like `owner/repo/tree/ref/path` and full `https://github.com/...` URLs are interchangeable.
@@ -166,7 +225,3 @@ Shorthands like `owner/repo/tree/ref/path` and full `https://github.com/...` URL
 ## Authentication
 
 Run `trackcn auth login` for a browser-based GitHub login, or set `GITHUB_TOKEN` (e.g. in CI) — either lifts the API limit from 60 to 5,000 requests/hour. Required in practice for large directories and busy networks. If you hit the limit unauthenticated at an interactive terminal, trackcn starts the login for you.
-
-## License
-
-MIT
