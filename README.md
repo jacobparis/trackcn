@@ -1,19 +1,98 @@
 # trackcn
 
-Sync files, directories, commits, and pull requests from GitHub into your codebase — and keep pulling updates as upstream changes. Think shadcn, for anything on GitHub.
+Clone individual files and directories from various GitHub repositories into your codebase, and pull upstream changes at any time.
 
 ```bash
-npx trackcn add https://github.com/mattpocock/skills/tree/main/skills ./.cursor/skills
+npx trackcn add vercel/ai/blob/main/AGENTS.md ./AGENTS.md
 ```
 
-Everything you install is tracked in `trackcn.json` with the source URL, the upstream revision, and a content hash for every file. From then on:
+## Use-cases
+
+### Agent skills
+
+Install a skill library once, modify the skills to fit your project, and keep pulling upstream improvements without losing your edits:
 
 ```bash
-trackcn status   # is upstream ahead? did I edit anything locally?
-trackcn pull     # apply upstream changes, protecting local edits
+trackcn add mattpocock/skills/tree/main/skills ./.cursor/skills
 ```
 
-You're expected to modify the files you install. When upstream changes a file you've also changed, `trackcn pull` doesn't clobber your version — it prepends a merge marker block containing the upstream diff:
+Skills are just markdown in GitHub directories — trackcn doesn't care which agent consumes them. Claude reads `./.claude/skills/`, Cursor reads `./.cursor/skills/`; track the same upstream into both, or track one and symlink the other.
+
+Use trackcn when you intend to **edit the skills you install** — a `design.md` you tune to your product, project best practices you extend — and still want upstream updates. Your edits are protected: updates arrive as merge markers, never overwrites. If a skill is pure documentation you'll never touch, a plain skill installer like skills.sh is all you need.
+
+### Single files
+
+Mirror a canonical file into every project that needs it:
+
+```bash
+trackcn add vercel/ai/blob/main/AGENTS.md ./AGENTS.md
+```
+
+Gists (`trackcn add https://gist.github.com/user/abc123`) and any raw `https://` URL work too.
+
+### Directories
+
+Track a maintainer-quality folder across every repository:
+
+```bash
+trackcn add vercel/ai/tree/main/.github/ISSUE_TEMPLATE ./.github/ISSUE_TEMPLATE
+```
+
+### Templates
+
+Start from an upstream example without forking it. When upstream ships improvements, pull them into your modified copy:
+
+```bash
+trackcn add vercel/next.js/tree/canary/examples/with-sentry .
+```
+
+### Registry bundles
+
+Repositories that publish a root [shadcn GitHub registry](https://ui.shadcn.com/docs/registry/github) `registry.json` expose curated installable items — configs, rules, docs, workflows:
+
+```bash
+trackcn add acme/toolkit                    # list a repository's install options
+trackcn add acme/toolkit/project-conventions
+trackcn add acme/toolkit/project-conventions#v1.0.0
+```
+
+### Post-pull hooks
+
+Run a command whenever a source's files change on pull — pull SVG icons and regenerate your sprite sheet automatically:
+
+```bash
+trackcn add lucide-icons/lucide/tree/main/icons ./icons --post-pull "pnpm build:icons"
+```
+
+### Line ranges
+
+Track only the lines you need from a source file:
+
+```bash
+trackcn add owner/repo/blob/main/styles.css#L227-L300 ./styles/prose.css
+```
+
+**Preview:** ranges re-slice on pull but are positional — they can't follow content that moves upstream.
+
+### Commits, commit ranges, and pull requests
+
+Diffs are diffs. Apply a changeset directly instead of waiting for a release, or ship a reviewed feature twice — build it as a PR in one repo, apply it to the next:
+
+```bash
+trackcn add owner/repo/commit/abc1234              # one commit's changes
+trackcn add owner/repo/compare/v1.0...v2.0         # everything between two revisions
+trackcn add owner/repo/pull/42                     # a PR's changes; pull picks up new commits
+```
+
+**Preview:** commits are immutable (`pull` is a no-op); branch-head ranges and PRs update incrementally.
+
+## How it works
+
+Everything you install is recorded in `trackcn.json` — committed to your repo, so every collaborator and CI run gets the same content:
+
+- Each tracked file and directory is marked with the upstream commit SHA it came from, plus a content hash of what was written.
+- `trackcn pull` computes the upstream diff from the point you diverged to the latest upstream, then applies that diff over your code — not the upstream contents.
+- Where the diff collides with your local edits, trackcn prepends a merge-marker block containing the upstream diff:
 
 ```
 <<<<<<< trackcn
@@ -31,11 +110,13 @@ export function greet(name: string): string {
 }
 ```
 
-The file is intentionally invalid until resolved. It's not the kind of merge conflict you solve by hand anymore — tell your agent to run `trackcn pull` and reconcile. The agent sees exactly what changed upstream, applies it to your modified version, updates any other files affected by the change, and removes the markers.
+The file is intentionally invalid until resolved — but this isn't the kind of conflict you solve by hand anymore. The block is the pure upstream diff and the code below it is yours, so tell your agent to run `trackcn pull` and reconcile: it applies the upstream change to your version and removes the markers.
+
+If a file on disk still matches what trackcn last wrote, upstream changes apply cleanly and silently. If you modified it, it's protected — markers, never overwrites. `--force` overrides, `--dry-run` previews. See [SPEC.md](SPEC.md) for the full merge semantics.
 
 ## For agents
 
-trackcn ships a version-matched usage guide with the CLI itself:
+trackcn ships a version-matched usage guide with the CLI:
 
 ```bash
 trackcn skills get trackcn
@@ -47,137 +128,7 @@ Or install it as a skill so your agent knows the workflow before it ever runs a 
 trackcn add jacobparis/trackcn/trackcn-skill
 ```
 
-All commands accept `--json` for structured output, and `--dry-run` to preview without writing.
-
-## Use-cases
-
-| | Like shadcn for... | Status |
-|---|---|---|
-| [Agent skills](#agent-skills) | skills | Stable |
-| [Single files](#single-files) | gists | Stable |
-| [Directories](#directories) | github | Stable |
-| [Registry bundles](#registry-bundles) | registries | Stable |
-| [Post-pull hooks](#post-pull-hooks) | icons | Stable |
-| [Templates](#templates) | templates | Stable |
-| [Line ranges](#line-ranges) | CSS snippets | Preview |
-| [Commits](#commits) | commits | Preview |
-| [Commit ranges](#commit-ranges) | features | Preview |
-| [Pull requests](#pull-requests) | pull requests | Preview |
-
-### Agent skills
-
-Agentic best practices change with every new model. Install a shared skill library once and let every repo pull the latest guidance:
-
-```bash
-trackcn add https://github.com/mattpocock/skills/tree/main/skills ./.cursor/skills
-```
-
-Skills are just markdown files in GitHub directories — trackcn doesn't care which agent consumes them. Claude uses `./.claude/skills/`, Cursor uses `./.cursor/skills/`; track the same upstream into both, or track one and symlink the other. The project-vs-user split is just a function of where you run trackcn: run it from a repo root for project scope, from `$HOME` for user scope.
-
-### Single files
-
-Mirror a canonical file into every project that needs it:
-
-```bash
-trackcn add https://github.com/vercel/ai/blob/main/AGENTS.md ./AGENTS.md
-```
-
-Gists work too — `trackcn add https://gist.github.com/user/abc123` — and so does any raw `https://` URL.
-
-### Directories
-
-Track a maintainer-quality folder across every repository:
-
-```bash
-trackcn add https://github.com/vercel/ai/tree/main/.github/ISSUE_TEMPLATE ./.github/ISSUE_TEMPLATE
-```
-
-### Registry bundles
-
-trackcn consumes the same repository-authored bundles as [shadcn GitHub registries](https://ui.shadcn.com/docs/registry/github). A repository adds a root `registry.json` to publish curated installable items — configs, rules, docs, templates, workflows — without inventing another catalog format.
-
-```bash
-trackcn add <owner>/<repo>              # list a repository's install options
-trackcn add <owner>/<repo>/<item>       # install a curated bundle
-trackcn add <owner>/<repo>/<item>#v1.0.0  # pin to a ref
-```
-
-The bundle is recorded in `trackcn.json`, so `status` and `pull` keep it current. The shadcn CLI stays compatible for one-time installs.
-
-### Post-pull hooks
-
-Run a command whenever a source's files change on pull. Pull SVG sources and regenerate your sprite sheet automatically:
-
-```bash
-trackcn add https://github.com/lucide-icons/lucide/tree/main/icons ./icons --post-pull "pnpm build:icons"
-```
-
-### Templates
-
-Track a template instead of forking it. Start from an upstream example and keep improvements pullable over time:
-
-```bash
-trackcn add https://github.com/vercel/next.js/tree/canary/examples/with-sentry .
-```
-
-No special command — a template is just more files. When upstream releases new features, `trackcn pull` brings them in and your local changes are protected by merge markers.
-
-### Line ranges
-
-Track only the lines you need from a source file, not the whole thing:
-
-```bash
-trackcn add https://github.com/owner/repo/blob/main/styles.css#L227-L300 ./styles/prose.css
-```
-
-**Preview:** line ranges re-slice on `pull`, but are only supported on full `blob` URLs (not `owner/repo/path#L10` shorthand) and can't follow content that moves to different line numbers upstream.
-
-### Commits
-
-There's no point waiting for upstream to cut a release — take a commit and apply its diff directly to your project:
-
-```bash
-trackcn add https://github.com/owner/repo/commit/<sha>
-```
-
-Added files are written, modified files are overwritten or merge-marked depending on your local state, and the whole changeset is tracked in the manifest. Commits are immutable, so `pull` is a no-op.
-
-### Commit ranges
-
-The feature you want is usually more than one commit. Diffs are diffs — apply the delta between two revisions at once:
-
-```bash
-trackcn add https://github.com/owner/repo/compare/base...head
-```
-
-If `head` is a branch name, `trackcn pull` picks up new commits incrementally.
-
-### Pull requests
-
-Ship a reviewed feature twice. Prompt an agent to build a feature as a PR, get it reviewed, then apply that nicely packaged feature to your other projects instead of prompting from scratch:
-
-```bash
-trackcn add https://github.com/owner/repo/pull/42
-```
-
-`trackcn pull` detects new commits pushed to the PR and applies them incrementally.
-
-## How it works
-
-1. **Add upstream code.** Point at a file, directory, registry item, commit, or PR.
-2. **Commit the manifest.** `trackcn.json` records the source, revision, and per-file content hashes. Every collaborator and CI run gets the same content.
-3. **Pull when upstream moves.** `trackcn status` shows drift. `trackcn pull` applies the change.
-
-For every file operation, trackcn compares three hashes — what it last wrote (stored), what's on disk now, and what upstream has:
-
-| Stored == Disk | Upstream changed | Action |
-|---|---|---|
-| Yes | Yes | Overwrite (safe) |
-| Yes | No | Skip (nothing changed) |
-| No | No | Skip (only you changed it) |
-| No | Yes | Prepend merge markers |
-
-If the file on disk matches what trackcn last wrote, following upstream is safe. If you modified it, the file is protected. `--force` overrides, `--dry-run` previews.
+All commands accept `--json` for structured output.
 
 ## Commands
 
@@ -190,7 +141,7 @@ trackcn auth [login|status|logout]   Manage GitHub login
 trackcn skills [list|get|path]       Load version-matched usage guides for agents
 ```
 
-See [SPEC.md](SPEC.md) for the full specification: URL formats, manifest schema, merge semantics, JSON output shapes, and recipes.
+Shorthands like `owner/repo/tree/ref/path` and full `https://github.com/...` URLs are interchangeable.
 
 ### CI gate
 
@@ -202,7 +153,7 @@ See [SPEC.md](SPEC.md) for the full specification: URL formats, manifest schema,
 
 ## Authentication
 
-Set `GITHUB_TOKEN` (or `TRACKCN_GITHUB_TOKEN`) for authenticated GitHub API access — 5,000 requests/hour instead of 60. Required in practice for large directories and busy networks. `trackcn auth login` offers a browser login on builds configured with a GitHub App client id (`TRACKCN_GITHUB_CLIENT_ID`).
+Set `GITHUB_TOKEN` (or `TRACKCN_GITHUB_TOKEN`) for authenticated GitHub API access — 5,000 requests/hour instead of 60. Required in practice for large directories and busy networks.
 
 ## License
 
