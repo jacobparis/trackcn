@@ -957,7 +957,7 @@ describe('CLI add: GitHub shorthand and curated bundles', () => {
     expect(commitAuthorization).toBe('token stored-token');
   });
 
-  it('runs GitHub App device login and retries when a private repo looks missing', async () => {
+  it('runs GitHub App device login and retries when anonymous requests are rejected', async () => {
     let commitRequests = 0;
     let tokenPolls = 0;
     let privateCommitAuthorization = '';
@@ -1005,7 +1005,7 @@ describe('CLI add: GitHub shorthand and curated bundles', () => {
         path: '/repos/acme/toolkit/commits/trunk',
         handler: (req, res) => {
           commitRequests++;
-          if (!req.headers.authorization) return jsonResponse(res, { message: 'Not found' }, 404);
+          if (!req.headers.authorization) return jsonResponse(res, { message: 'API rate limit exceeded' }, 403);
           privateCommitAuthorization = req.headers.authorization;
           jsonResponse(res, { sha });
         },
@@ -1042,6 +1042,96 @@ describe('CLI add: GitHub shorthand and curated bundles', () => {
     expect(commitRequests).toBe(2);
     expect(tokenPolls).toBe(1);
     expect(privateCommitAuthorization).toBe('token app-token');
+  });
+
+  it('preemptively logs in when the anonymous quota is nearly exhausted', async () => {
+    let tokenPolls = 0;
+    let authedCommitRequests = 0;
+    mockServer.close();
+
+    const mock = createMockServer([
+      {
+        method: 'POST',
+        path: '/login/device/code',
+        handler: (_req, res) => jsonResponse(res, {
+          device_code: 'device-code',
+          user_code: 'ABCD-1234',
+          verification_uri: `${githubApiUrl}/login/device`,
+          expires_in: 60,
+          interval: 1,
+        }),
+      },
+      {
+        method: 'POST',
+        path: '/login/oauth/access_token',
+        handler: (_req, res) => {
+          tokenPolls++;
+          jsonResponse(res, { access_token: 'app-token', expires_in: 3600 });
+        },
+      },
+      {
+        method: 'GET',
+        path: '/repos/acme/toolkit',
+        handler: (req, res) => {
+          // Anonymous requests are nearly out of quota
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'x-ratelimit-remaining': req.headers.authorization ? '4999' : '3',
+          });
+          res.end(JSON.stringify({ default_branch: 'trunk' }));
+        },
+      },
+      {
+        method: 'GET',
+        path: /^\/repos\/acme\/toolkit\/contents\/\?ref=/,
+        handler: (_req, res) => jsonResponse(res, [
+          {
+            name: 'README.md',
+            path: 'README.md',
+            type: 'file',
+            download_url: `${githubApiUrl}/raw/README.md`,
+          },
+        ]),
+      },
+      {
+        method: 'GET',
+        path: '/repos/acme/toolkit/commits/trunk',
+        handler: (req, res) => {
+          if (req.headers.authorization) authedCommitRequests++;
+          jsonResponse(res, { sha: 'sha-v1' });
+        },
+      },
+      {
+        method: 'GET',
+        path: '/raw/README.md',
+        handler: (_req, res) => {
+          res.writeHead(200, { 'Content-Type': 'text/plain' });
+          res.end('# Toolkit\n');
+        },
+      },
+    ]);
+    githubApiUrl = await mock.start();
+    mockServer = mock.server;
+
+    const home = mkdtempSync(join(tmpdir(), 'trackcn-home-'));
+
+    const { code } = await run(['add', 'acme/toolkit', '.'], dir, {
+      ...githubEnv(),
+      TRACKCN_GITHUB_WEB_URL: githubApiUrl,
+      TRACKCN_GITHUB_CLIENT_ID: 'client-id',
+      TRACKCN_GITHUB_AUTO_LOGIN: '1',
+      TRACKCN_GITHUB_OPEN_BROWSER: '0',
+      HOME: home,
+      TRACKCN_GITHUB_TOKEN: '',
+      GITHUB_TOKEN: '',
+      GH_TOKEN: '',
+    });
+
+    rmSync(home, { recursive: true, force: true });
+    expect(code).toBe(0);
+    // The login happened before any request failed, and later calls used it
+    expect(tokenPolls).toBe(1);
+    expect(authedCommitRequests).toBeGreaterThan(0);
   });
 
   it('installs a curated bundle and records its requirements', async () => {

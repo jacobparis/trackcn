@@ -189,8 +189,31 @@ async function loginWithGitHubApp(reason?: string): Promise<GitHubAuth> {
   throw new Error('GitHub auth timed out before the login was completed.');
 }
 
+// 404 is deliberately absent: it usually means a typo'd URL, and bouncing that
+// user into a browser login is worse than the "may be private" hint in the
+// error message. Login provably fixes 401/403/429.
 function isAuthRecoverableStatus(status: number): boolean {
-  return status === 401 || status === 403 || status === 404;
+  return status === 401 || status === 403 || status === 429;
+}
+
+// Preemptive login fires at most once per process — if the user abandons the
+// browser flow, keep going anonymously until the hard limit handles it.
+let preemptiveLoginAttempted = false;
+
+async function maybePreemptiveLogin(response: Response, allowLogin: boolean): Promise<void> {
+  if (!response.ok || !allowLogin || preemptiveLoginAttempted) return;
+  if (!canAutoLogin() || getGitHubAuth()) return;
+  const remainingHeader = response.headers.get('x-ratelimit-remaining');
+  if (remainingHeader === null) return;
+  const remaining = Number(remainingHeader);
+  // Log in before the anonymous quota runs dry instead of failing mid-operation.
+  if (!Number.isFinite(remaining) || remaining > 5) return;
+  preemptiveLoginAttempted = true;
+  try {
+    await loginWithGitHubApp(`only ${remaining} anonymous GitHub requests left this hour`);
+  } catch (error) {
+    console.error(`Continuing without login: ${(error as Error).message}`);
+  }
 }
 
 // Auto-starting the browser device-code flow only makes sense on an
@@ -233,12 +256,13 @@ async function githubFetch(url: string, allowLogin = true): Promise<Response> {
   const ms = Date.now() - start;
   await trace('api:github', { url, status: response.status, ms });
   if (!response.ok && allowLogin && canAutoLogin() && isAuthRecoverableStatus(response.status) && !getGitHubAuth()) {
-    await loginWithGitHubApp(response.status === 404 ? 'GitHub returned 404 for a repository that may be private' : `GitHub returned ${response.status}`);
+    await loginWithGitHubApp(`GitHub returned ${response.status}`);
     return githubFetch(url, false);
   }
   if (!response.ok) {
     throw githubErrorFromStatus(response, url);
   }
+  await maybePreemptiveLogin(response, allowLogin);
   return response;
 }
 
