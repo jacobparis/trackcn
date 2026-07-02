@@ -182,8 +182,7 @@ requests need authentication or a higher rate limit:
 TRACKCN_GITHUB_TOKEN=... trackcn pull
 ```
 
-On builds configured with a GitHub App client id (`TRACKCN_GITHUB_CLIENT_ID`),
-trackcn can also store a browser login outside the manifest:
+For interactive use, trackcn can store a browser login outside the manifest:
 
 ```bash
 trackcn auth login
@@ -191,8 +190,9 @@ trackcn auth status
 trackcn auth logout
 ```
 
-Without a client id, `auth login` is unavailable — use a token instead. A
-stored login lives in `~/.trackcn/auth.json`, never in `trackcn.json`.
+A stored login lives in `~/.trackcn/auth.json`, never in `trackcn.json`. In CI
+or headless environments, use a token env var instead — the browser flow only
+auto-starts at an interactive terminal.
 
 ## Load this guide again
 

@@ -165,7 +165,7 @@ Shorthands like `owner/repo/tree/ref/path` and full `https://github.com/...` URL
 
 ## Authentication
 
-Set `GITHUB_TOKEN` (or `TRACKCN_GITHUB_TOKEN`) for authenticated GitHub API access — 5,000 requests/hour instead of 60. Required in practice for large directories and busy networks.
+Run `trackcn auth login` for a browser-based GitHub login, or set `GITHUB_TOKEN` (e.g. in CI) — either lifts the API limit from 60 to 5,000 requests/hour. Required in practice for large directories and busy networks. If you hit the limit unauthenticated at an interactive terminal, trackcn starts the login for you.
 
 ## License
 

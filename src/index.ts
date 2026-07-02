@@ -26,7 +26,7 @@ const GITHUB_HEADERS = {
 
 const GITHUB_API_URL = process.env.TRACKCN_GITHUB_API_URL || 'https://api.github.com';
 const GITHUB_WEB_URL = process.env.TRACKCN_GITHUB_WEB_URL || 'https://github.com';
-const DEFAULT_GITHUB_CLIENT_ID = '';
+const DEFAULT_GITHUB_CLIENT_ID = 'Iv23lipAevefibNIkhzv';
 const GITHUB_CLIENT_ID = process.env.TRACKCN_GITHUB_CLIENT_ID || DEFAULT_GITHUB_CLIENT_ID;
 const AUTH_DIR = join(homedir(), '.trackcn');
 const AUTH_PATH = join(AUTH_DIR, 'auth.json');
@@ -115,7 +115,12 @@ async function fetchGitHubDeviceJson(path: string, body: URLSearchParams): Promi
     },
     body,
   });
-  if (!response.ok) throw new Error(`GitHub auth error: ${response.status} ${response.statusText}`);
+  if (!response.ok) {
+    // GitHub returns the useful part (e.g. device_flow_disabled) in the body.
+    const body = await response.json().catch(() => null) as { error?: string; error_description?: string } | null;
+    const detail = body?.error_description || body?.error;
+    throw new Error(`GitHub auth error: ${response.status} ${response.statusText}${detail ? ` — ${detail}` : ''}`);
+  }
   return response.json();
 }
 
@@ -188,6 +193,18 @@ function isAuthRecoverableStatus(status: number): boolean {
   return status === 401 || status === 403 || status === 404;
 }
 
+// Auto-starting the browser device-code flow only makes sense on an
+// interactive terminal — in CI/headless runs it would print a code and poll
+// for up to 15 minutes. There, fail fast with the GITHUB_TOKEN hint instead.
+// TRACKCN_GITHUB_AUTO_LOGIN=1/0 overrides the TTY detection either way.
+function canAutoLogin(): boolean {
+  if (!GITHUB_CLIENT_ID) return false;
+  const override = process.env.TRACKCN_GITHUB_AUTO_LOGIN;
+  if (override === '1') return true;
+  if (override === '0') return false;
+  return Boolean(process.stderr.isTTY);
+}
+
 // The browser login flow only exists on builds configured with a GitHub App
 // client id — without one, errors point at token env vars instead.
 function githubAuthHint(): string {
@@ -215,7 +232,7 @@ async function githubFetch(url: string, allowLogin = true): Promise<Response> {
   const response = await fetch(url, { headers });
   const ms = Date.now() - start;
   await trace('api:github', { url, status: response.status, ms });
-  if (!response.ok && allowLogin && GITHUB_CLIENT_ID && isAuthRecoverableStatus(response.status) && !getGitHubAuth()) {
+  if (!response.ok && allowLogin && canAutoLogin() && isAuthRecoverableStatus(response.status) && !getGitHubAuth()) {
     await loginWithGitHubApp(response.status === 404 ? 'GitHub returned 404 for a repository that may be private' : `GitHub returned ${response.status}`);
     return githubFetch(url, false);
   }
@@ -228,7 +245,7 @@ async function githubFetch(url: string, allowLogin = true): Promise<Response> {
 async function githubDownload(url: string, allowLogin = true): Promise<Response> {
   const headers: Record<string, string> = githubAuthHeaders();
   const response = await fetch(url, { headers });
-  if (!response.ok && allowLogin && GITHUB_CLIENT_ID && isAuthRecoverableStatus(response.status) && !getGitHubAuth()) {
+  if (!response.ok && allowLogin && canAutoLogin() && isAuthRecoverableStatus(response.status) && !getGitHubAuth()) {
     await loginWithGitHubApp(`GitHub download returned ${response.status}`);
     return githubDownload(url, false);
   }

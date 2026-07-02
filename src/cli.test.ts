@@ -1029,6 +1029,7 @@ describe('CLI add: GitHub shorthand and curated bundles', () => {
       ...githubEnv(),
       TRACKCN_GITHUB_WEB_URL: githubApiUrl,
       TRACKCN_GITHUB_CLIENT_ID: 'client-id',
+      TRACKCN_GITHUB_AUTO_LOGIN: '1',
       TRACKCN_GITHUB_OPEN_BROWSER: '0',
       HOME: home,
       TRACKCN_GITHUB_TOKEN: '',
@@ -1867,18 +1868,19 @@ describe('pull safety and merge semantics', () => {
     expect(existsSync(join(dir, 'trackcn.json'))).toBe(false);
   });
 
-  it('rate-limit errors point at GITHUB_TOKEN, not at the unavailable browser login', async () => {
+  it('rate-limit errors point at GITHUB_TOKEN and never hang on auto-login when headless', async () => {
     const add = await run('add https://github.com/acme/widgets/blob/main/docs/AGENTS.md ./notes', dir, githubEnv());
     expect(add.code).toBe(0);
 
     headSha = 'sha-v2';
     failContentsWith403 = true;
 
+    // Not a TTY here — the browser device-code flow must not auto-start
     const pull = await run('pull', dir, githubEnv());
     expect(pull.code).toBe(1);
     expect(pull.stdout + pull.stderr).toContain('rate limit');
     expect(pull.stdout + pull.stderr).toContain('GITHUB_TOKEN');
-    expect(pull.stdout + pull.stderr).not.toContain('auth login');
+    expect(pull.stdout + pull.stderr).not.toContain('login/device');
   });
 
   it('one failing source does not abort the rest of the pull', async () => {
