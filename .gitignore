@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.trackcn/
+.env
+.env.*
+!.env.example
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+coverage/
+*.tsbuildinfo
+.DS_Store

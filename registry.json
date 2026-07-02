@@ -1,0 +1,20 @@
+{
+  "$schema": "https://ui.shadcn.com/schema/registry.json",
+  "name": "trackcn",
+  "homepage": "https://github.com/jacobparis/trackcn",
+  "items": [
+    {
+      "name": "trackcn-skill",
+      "type": "registry:item",
+      "title": "trackcn Agent Skill",
+      "description": "Teach agents to sync files, directories, commits, pull requests, and skills with trackcn.",
+      "files": [
+        {
+          "path": "skills/trackcn/SKILL.md",
+          "type": "registry:file",
+          "target": "~/.agents/skills/trackcn/SKILL.md"
+        }
+      ]
+    }
+  ]
+}

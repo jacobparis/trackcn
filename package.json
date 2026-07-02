@@ -1,0 +1,66 @@
+{
+  "name": "trackcn",
+  "version": "0.5.2",
+  "description": "Track GitHub files, directories, commits, pull requests, and agent skills like dependencies.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "bin": {
+    "trackcn": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "README.md",
+    "SPEC.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts",
+    "dev": "tsup src/index.ts --format esm --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "pnpm typecheck && pnpm build && pnpm test",
+    "pack:check": "pnpm build && npm pack --dry-run"
+  },
+  "keywords": [
+    "cli",
+    "agent",
+    "github",
+    "shadcn",
+    "sync",
+    "dependencies",
+    "installer",
+    "skills"
+  ],
+  "homepage": "https://github.com/jacobparis/trackcn#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jacobparis/trackcn.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jacobparis/trackcn/issues"
+  },
+  "author": "Jacob Paris",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "arg": "^5.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^4.0.18"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "packageManager": "pnpm@10.25.0"
+}
