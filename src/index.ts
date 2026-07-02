@@ -815,7 +815,7 @@ async function trace(event: string, data?: Record<string, unknown>): Promise<voi
 // CLI: arg parsing
 // ============================================================================
 
-const VERSION = '0.6.0';
+const VERSION = '0.7.0';
 
 function showHelp() {
   console.log(`
