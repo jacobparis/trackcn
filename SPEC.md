@@ -60,6 +60,7 @@ trackcn add .../frontend-design .../pdf ./.claude/skills/
 2. `trackcn add <owner>/<repo> .` installs the complete repository using its actual default branch.
 3. `trackcn add <owner>/<repo>/<item>` resolves a curated registry item first, then falls back to a repository path when no item matches.
 4. Registry `include` files, nested item names, `~/` project-root targets, same-repository dependencies, and optional `#ref` pins are supported.
+5. `@alias/...` targets resolve through the project's `components.json` aliases when present. Installs never fail on aliases: without a usable `components.json`, the alias name becomes a plain directory (`@ui/button.tsx` → `ui/button.tsx`) — trackcn assumes nothing about any framework's conventions.
 5. Registry bundles are tracked as sources so `status`, `pull`, and `remove` work normally.
 
 **Behavior for changeset sources (commit, commit-range, pull):**

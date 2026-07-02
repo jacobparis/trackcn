@@ -563,23 +563,29 @@ function normalizeRegistryTarget(target: string): string {
 
 function resolveRegistryTarget(rootDir: string, file: RegistryFile): string {
   const target = normalizeRegistryTarget(file.target || file.path);
-  const aliasMatch = target.match(/^@(components|ui|lib|hooks)\/(.+)$/);
+  const aliasMatch = target.match(/^@([^/]+)\/(.+)$/);
   if (!aliasMatch) return target;
 
+  // When components.json can't resolve an alias, fall back to the alias name
+  // as a plain directory (`@ui/button.tsx` -> `ui/button.tsx`). trackcn knows
+  // nothing about any framework's conventions — a mechanically-placed file the
+  // consumer's linter/agent can relocate beats a failed install.
+  const fallback = normalizeRegistryTarget(join(aliasMatch[1], aliasMatch[2]));
+
   const componentsPath = join(rootDir, 'components.json');
-  if (!existsSync(componentsPath)) {
-    throw new Error(`Cannot resolve ${target} without components.json.`);
-  }
+  if (!existsSync(componentsPath)) return fallback;
 
-  const config = JSON.parse(readFileSync(componentsPath, 'utf-8')) as {
-    aliases?: Record<string, string>;
-  };
-  const alias = config.aliases?.[aliasMatch[1]];
-  if (!alias) {
-    throw new Error(`Cannot resolve ${target}: components.json has no ${aliasMatch[1]} alias.`);
+  try {
+    const config = JSON.parse(readFileSync(componentsPath, 'utf-8')) as {
+      aliases?: Record<string, string>;
+    };
+    const alias = config.aliases?.[aliasMatch[1]];
+    if (!alias) return fallback;
+    return normalizeRegistryTarget(join(alias.replace(/^@\//, ''), aliasMatch[2]));
+  } catch {
+    // Malformed components.json shouldn't fail the install either.
+    return fallback;
   }
-
-  return normalizeRegistryTarget(join(alias.replace(/^@\//, ''), aliasMatch[2]));
 }
 
 async function resolveRegistryBundle(

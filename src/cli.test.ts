@@ -1134,6 +1134,44 @@ describe('CLI add: GitHub shorthand and curated bundles', () => {
     expect(authedCommitRequests).toBeGreaterThan(0);
   });
 
+  it('never fails on alias targets: components.json resolves them, otherwise the alias becomes a directory', async () => {
+    registryItems = [
+      {
+        name: 'button',
+        type: 'registry:item',
+        files: [
+          {
+            path: 'ui/button.tsx',
+            type: 'registry:file',
+            target: '@ui/button.tsx',
+            content: 'export const Button = null\n',
+          },
+        ],
+      },
+    ];
+
+    // No components.json — mechanical fallback: @ui/button.tsx -> ui/button.tsx
+    const bare = await run('add acme/toolkit/button', dir, { ...githubEnv(), GITHUB_TOKEN: 'secret' });
+    expect(bare.code).toBe(0);
+    expect(readFileSync(join(dir, 'ui/button.tsx'), 'utf-8')).toBe('export const Button = null\n');
+
+    // With components.json — the alias wins
+    const dir2 = mkdtempSync(join(tmpdir(), 'trackcn-test-'));
+    writeFileSync(join(dir2, 'components.json'), JSON.stringify({ aliases: { ui: '@/src/components/ui' } }));
+    const aliased = await run('add acme/toolkit/button', dir2, { ...githubEnv(), GITHUB_TOKEN: 'secret' });
+    expect(aliased.code).toBe(0);
+    expect(readFileSync(join(dir2, 'src/components/ui/button.tsx'), 'utf-8')).toBe('export const Button = null\n');
+    rmSync(dir2, { recursive: true, force: true });
+
+    // Malformed components.json — still installs via the fallback
+    const dir3 = mkdtempSync(join(tmpdir(), 'trackcn-test-'));
+    writeFileSync(join(dir3, 'components.json'), '{not json');
+    const broken = await run('add acme/toolkit/button', dir3, { ...githubEnv(), GITHUB_TOKEN: 'secret' });
+    expect(broken.code).toBe(0);
+    expect(readFileSync(join(dir3, 'ui/button.tsx'), 'utf-8')).toBe('export const Button = null\n');
+    rmSync(dir3, { recursive: true, force: true });
+  });
+
   it('installs a curated bundle and records its requirements', async () => {
     const { code } = await run('add acme/toolkit/project-conventions', dir, githubEnv());
     expect(code).toBe(0);
