@@ -202,7 +202,7 @@ See [SPEC.md](SPEC.md) for the full specification: URL formats, manifest schema,
 
 ## Authentication
 
-Set `GITHUB_TOKEN` (or run `trackcn auth login`) for authenticated GitHub API access — 5,000 requests/hour instead of 60. Required in practice for large directories and busy networks.
+Set `GITHUB_TOKEN` (or `TRACKCN_GITHUB_TOKEN`) for authenticated GitHub API access — 5,000 requests/hour instead of 60. Required in practice for large directories and busy networks. `trackcn auth login` offers a browser login on builds configured with a GitHub App client id (`TRACKCN_GITHUB_CLIENT_ID`).
 
 ## License
 

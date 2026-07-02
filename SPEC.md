@@ -106,7 +106,7 @@ trackcn pull --json
 
 **Gist sources:**
 1. Fetch latest version. If version SHA unchanged, skip.
-2. Fetch both old and new versions, diff locally with `diff -u`.
+2. Fetch both old and new versions, diff locally (in-process, no external `diff` binary).
 3. Apply changes using same three-hash logic.
 4. Handle deletions (files removed from gist).
 
@@ -312,7 +312,9 @@ export function greet(name: string): string {
 
 The diff between `<<<<<<< trackcn` and `>>>>>>> trackcn` shows what changed upstream. The code below is the user's current version. The file is intentionally invalid until the markers are resolved.
 
-After adding markers, trackcn updates the stored hash to the new upstream content hash. This means a second `pull` won't pile on another marker block.
+After adding markers, trackcn updates the stored hash to the new upstream content hash. This means a second `pull` won't pile on another copy of the same marker block.
+
+The diff inside the block is the pure upstream delta (old upstream → new upstream), so applying it never removes local edits. If upstream changes again before an existing block is resolved, the new delta is stacked as an additional block above the old one — each distinct upstream change is preserved. When no clean upstream base is available (raw URLs without history), the file is skipped with a warning and the source stays at its old version so the next pull retries after resolution.
 
 ## Three-hash merge logic
 
@@ -449,6 +451,8 @@ One principle: **if the file on disk matches what trackcn last wrote (stored has
 | File modified by user, upstream changed | Prepend merge markers |
 | File modified by user, upstream deleted | Skip with warning |
 | File exists but not tracked by this source (`add`) | Skip (use `--force`) |
+| Upstream added a file that exists locally untracked (`pull`) | Skip with warning (use `--force`) |
+| Upstream renamed onto a path that exists locally untracked (`pull`) | Skip with warning (use `--force`) |
 | `--force` on any command | Override all protections |
 | `--dry-run` on `add` or `pull` | Show what would happen without writing project files or `trackcn.json` |
 
@@ -467,7 +471,9 @@ Every destructive operation has an inverse:
 
 ## Authentication
 
-`GITHUB_TOKEN` env var enables authenticated API access (5000 req/hr vs 60/hr unauthenticated). Used for all GitHub API calls. Rate limit errors (403) suggest setting this variable.
+`GITHUB_TOKEN` (or `TRACKCN_GITHUB_TOKEN`, `GH_TOKEN`) enables authenticated API access (5000 req/hr vs 60/hr unauthenticated). Used for all GitHub API calls. Rate limit errors (403) suggest setting this variable.
+
+`trackcn auth login` starts a browser device-code login, but only on builds configured with a GitHub App client id (`TRACKCN_GITHUB_CLIENT_ID`). Without one, use a token.
 
 ---
 
@@ -614,11 +620,11 @@ Skills are just GitHub directories. `trackcn add org/skills/frontend-design ./.c
 
 ### "pull prose styles from global.css#L227" (line ranges) — implemented, needs polish
 
-**What works:** `trackcn add .../global.css#L227` and `#L227-L300` extract the specified lines on initial add. Tracked as separate sources.
+**What works:** `trackcn add .../global.css#L227` and `#L227-L300` extract the specified lines on initial add, and `pull`/`status` re-slice the same range on every refetch. Tracked as separate sources.
 
 **Gaps:**
-- [ ] **Pull doesn't slice on update.** When pulling updates for a line-range source, the Compare API path doesn't apply line slicing — it works on full-file diffs. The full-refetch fallback would need line slicing added. Currently line-range sources only get correct content on initial add, not on subsequent pulls.
-- [ ] **No line-range awareness in shorthand URLs.** `owner/repo/path/file.ts#L10` doesn't work because the shorthand parser doesn't strip fragments. Only full `blob` URLs support line ranges.
+- [ ] **No line-range awareness in shorthand URLs.** `owner/repo/path/file.ts#L10` doesn't work because the shorthand parser treats fragments as refs. Only full `blob` URLs support line ranges.
+- [ ] **Ranges don't follow moving content.** The slice is positional; if the lines move upstream, the range still selects the original line numbers.
 
 ### "shadcn for commits" — implemented, needs testing
 

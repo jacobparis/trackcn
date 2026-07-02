@@ -101,11 +101,13 @@ prepends a `<<<<<<< trackcn` marker block and reports the file in `merged`.
 After a merge:
 
 1. Open every file listed in `merged`.
-2. Treat the marker block as the upstream diff and the content below it as the
-   local version.
-3. Reconcile the intended result in the file.
-4. Remove the entire marker block, including the `<<<<<<< trackcn`, `=======`,
-   and `>>>>>>> trackcn` lines.
+2. Treat each marker block as an upstream diff and the content below the
+   blocks as the local version. Successive upstream changes stack as separate
+   blocks, newest first — apply them oldest-to-newest.
+3. Reconcile the intended result in the file. The diff is upstream-only
+   (old upstream → new upstream), so applying it never removes local edits.
+4. Remove every marker block, including the `<<<<<<< trackcn` and
+   `>>>>>>> trackcn` lines.
 5. Run tests or validation for the affected code.
 6. Run `trackcn status --json` and confirm there are no unresolved merges.
 
@@ -180,7 +182,8 @@ requests need authentication or a higher rate limit:
 TRACKCN_GITHUB_TOKEN=... trackcn pull
 ```
 
-For local development, trackcn can store a GitHub login outside the manifest:
+On builds configured with a GitHub App client id (`TRACKCN_GITHUB_CLIENT_ID`),
+trackcn can also store a browser login outside the manifest:
 
 ```bash
 trackcn auth login
@@ -188,9 +191,8 @@ trackcn auth status
 trackcn auth logout
 ```
 
-If a private repository looks missing and no token is available, trackcn starts
-the GitHub App browser login flow and retries the request. The login token is
-stored in `~/.trackcn/auth.json`, not in `trackcn.json`.
+Without a client id, `auth login` is unavailable — use a token instead. A
+stored login lives in `~/.trackcn/auth.json`, never in `trackcn.json`.
 
 ## Load this guide again
 

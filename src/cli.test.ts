@@ -1643,3 +1643,273 @@ describe('binary files: raw URL sources', () => {
     expect(readFileSync(join(dir, 'logo.png')).equals(PNG)).toBe(true);
   });
 });
+
+// ============================================================================
+// Launch hardening: pull safety, merge semantics, path traversal, auth errors
+// ============================================================================
+
+describe('pull safety and merge semantics', () => {
+  let dir: string;
+  let mockServer: Server;
+  let githubApiUrl = '';
+
+  // Mutable upstream state
+  let headSha = '';
+  let contentByRef: Record<string, string> = {};
+  let dirFiles: Record<string, string> = {};
+  let compareFiles: Array<Record<string, unknown>> | null = null;
+  let failContentsWith403 = false;
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'trackcn-test-'));
+    headSha = 'sha-v1';
+    contentByRef = { 'sha-v1': 'hello v1\n', main: 'hello v1\n' };
+    dirFiles = { 'src/a.md': 'aaa v1\n', 'src/b.md': 'bbb v1\n' };
+    compareFiles = null;
+    failContentsWith403 = false;
+
+    const mock = createMockServer([
+      {
+        method: 'GET',
+        path: /^\/repos\/acme\/widgets$/,
+        handler: (_req, res) => jsonResponse(res, { default_branch: 'main' }),
+      },
+      {
+        method: 'GET',
+        path: /^\/repos\/acme\/widgets\/commits\/main$/,
+        handler: (_req, res) => jsonResponse(res, { sha: headSha }),
+      },
+      {
+        method: 'GET',
+        path: /^\/repos\/acme\/widgets\/contents\/docs\/AGENTS\.md\?ref=/,
+        handler: (req, res) => {
+          if (failContentsWith403) {
+            res.writeHead(403, { 'Content-Type': 'application/json', 'x-ratelimit-remaining': '0' });
+            res.end(JSON.stringify({ message: 'API rate limit exceeded' }));
+            return;
+          }
+          const ref = decodeURIComponent((req.url || '').split('ref=')[1]);
+          jsonResponse(res, githubFile('docs/AGENTS.md', contentByRef[ref] ?? contentByRef.main));
+        },
+      },
+      {
+        method: 'GET',
+        path: /^\/repos\/acme\/widgets\/contents\/src\?ref=/,
+        handler: (_req, res) => jsonResponse(res, Object.keys(dirFiles).map((p) => ({
+          name: p.split('/').pop(),
+          path: p,
+          type: 'file',
+          download_url: `${githubApiUrl}/raw/${p}`,
+        }))),
+      },
+      {
+        method: 'GET',
+        path: /^\/repos\/acme\/widgets\/contents\/src\/[^?]+\?ref=/,
+        handler: (req, res) => {
+          const p = decodeURIComponent((req.url || '').replace(/^\/repos\/acme\/widgets\/contents\//, '').split('?')[0]);
+          if (dirFiles[p] === undefined) {
+            res.writeHead(404);
+            res.end(JSON.stringify({ message: 'Not Found' }));
+            return;
+          }
+          jsonResponse(res, githubFile(p, dirFiles[p]));
+        },
+      },
+      {
+        method: 'GET',
+        path: /^\/raw\/src\//,
+        handler: (req, res) => {
+          const p = (req.url || '').replace('/raw/', '');
+          res.writeHead(200, { 'Content-Type': 'text/plain' });
+          res.end(dirFiles[p] ?? '');
+        },
+      },
+      {
+        method: 'GET',
+        path: /^\/repos\/acme\/widgets\/compare\//,
+        handler: (_req, res) => jsonResponse(res, { files: compareFiles ?? [] }),
+      },
+      {
+        method: 'GET',
+        path: /^\/gists\/deadbeefdeadbeefdead$/,
+        handler: (_req, res) => jsonResponse(res, {
+          id: 'deadbeefdeadbeefdead',
+          description: 'evil gist',
+          files: {
+            'C:_Users_Public_evil.bat': { filename: 'C:_Users_Public_evil.bat', content: 'echo pwned\n' },
+          },
+          history: [{ version: 'gist-v1' }],
+        }),
+      },
+    ]);
+    githubApiUrl = await mock.start();
+    mockServer = mock.server;
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+    mockServer.close();
+  });
+
+  function githubEnv() {
+    return { TRACKCN_GITHUB_API_URL: githubApiUrl, GITHUB_TOKEN: '', TRACKCN_GITHUB_TOKEN: '', GH_TOKEN: '', HOME: dir };
+  }
+
+  it('does not delete tracked files when the refetch fails transiently (rate limit)', async () => {
+    const add = await run('add https://github.com/acme/widgets/blob/main/docs/AGENTS.md ./notes', dir, githubEnv());
+    expect(add.code).toBe(0);
+
+    // Upstream moves, but the contents fetch starts failing with 403
+    headSha = 'sha-v2';
+    failContentsWith403 = true;
+
+    const pull = await run('pull', dir, githubEnv());
+    expect(pull.code).toBe(1);
+    // The tracked file must survive, and the version must not advance
+    expect(readFileSync(join(dir, 'notes/AGENTS.md'), 'utf-8')).toBe('hello v1\n');
+    const manifest = JSON.parse(readFileSync(join(dir, 'trackcn.json'), 'utf-8'));
+    expect(manifest.sources[0].version).toBe('sha-v1');
+    expect(manifest.sources[0].files['notes/AGENTS.md']).toBeDefined();
+  });
+
+  it('merge markers carry the upstream diff, not the local edits as removals', async () => {
+    const add = await run('add https://github.com/acme/widgets/blob/main/docs/AGENTS.md ./notes', dir, githubEnv());
+    expect(add.code).toBe(0);
+
+    writeFileSync(join(dir, 'notes/AGENTS.md'), 'hello local\n');
+    headSha = 'sha-v2';
+    contentByRef = { 'sha-v1': 'hello v1\n', 'sha-v2': 'hello v2\n', main: 'hello v2\n' };
+
+    const pull = await run('pull', dir, githubEnv());
+    expect(pull.code).toBe(0);
+    const onDisk = readFileSync(join(dir, 'notes/AGENTS.md'), 'utf-8');
+    expect(onDisk).toContain('<<<<<<< trackcn');
+    // Upstream diff: v1 -> v2
+    expect(onDisk).toContain('-hello v1');
+    expect(onDisk).toContain('+hello v2');
+    // The local edit is preserved below the block, never shown as a removal
+    expect(onDisk).not.toContain('-hello local');
+    expect(onDisk).toContain('hello local');
+  });
+
+  it('a second upstream change stacks a new marker block instead of being lost', async () => {
+    await run('add https://github.com/acme/widgets/blob/main/docs/AGENTS.md ./notes', dir, githubEnv());
+
+    writeFileSync(join(dir, 'notes/AGENTS.md'), 'hello local\n');
+    headSha = 'sha-v2';
+    contentByRef = { 'sha-v1': 'hello v1\n', 'sha-v2': 'hello v2\n', main: 'hello v2\n' };
+
+    const first = await run('pull', dir, githubEnv());
+    expect(first.code).toBe(0);
+    expect((readFileSync(join(dir, 'notes/AGENTS.md'), 'utf-8').match(/<<<<<<< trackcn/g) || []).length).toBe(1);
+
+    // Upstream moves again before the first marker is resolved
+    headSha = 'sha-v3';
+    contentByRef = { 'sha-v1': 'hello v1\n', 'sha-v2': 'hello v2\n', 'sha-v3': 'hello v3\n', main: 'hello v3\n' };
+
+    const second = await run('pull', dir, githubEnv());
+    expect(second.code).toBe(0);
+    const onDisk = readFileSync(join(dir, 'notes/AGENTS.md'), 'utf-8');
+    expect((onDisk.match(/<<<<<<< trackcn/g) || []).length).toBe(2);
+    // The second block carries the v2 -> v3 delta
+    expect(onDisk).toContain('+hello v3');
+    // Local content still intact
+    expect(onDisk).toContain('hello local');
+
+    const manifest = JSON.parse(readFileSync(join(dir, 'trackcn.json'), 'utf-8'));
+    expect(manifest.sources[0].version).toBe('sha-v3');
+  });
+
+  it('repeated pulls do not duplicate an identical marker block', async () => {
+    await run('add https://github.com/acme/widgets/blob/main/docs/AGENTS.md ./notes', dir, githubEnv());
+
+    writeFileSync(join(dir, 'notes/AGENTS.md'), 'hello local\n');
+    headSha = 'sha-v2';
+    contentByRef = { 'sha-v1': 'hello v1\n', 'sha-v2': 'hello v2\n', main: 'hello v2\n' };
+
+    await run('pull', dir, githubEnv());
+    await run('pull', dir, githubEnv());
+    const onDisk = readFileSync(join(dir, 'notes/AGENTS.md'), 'utf-8');
+    expect((onDisk.match(/<<<<<<< trackcn/g) || []).length).toBe(1);
+  });
+
+  it('does not clobber an existing untracked local file when upstream adds one', async () => {
+    const add = await run('add https://github.com/acme/widgets/tree/main/src ./vendor', dir, githubEnv());
+    expect(add.code).toBe(0);
+
+    // A local, untracked file exists where upstream now adds one
+    writeFileSync(join(dir, 'vendor/c.md'), 'my precious local file\n');
+    headSha = 'sha-v2';
+    dirFiles = { 'src/a.md': 'aaa v1\n', 'src/b.md': 'bbb v1\n', 'src/c.md': 'ccc v1\n' };
+    compareFiles = [{ filename: 'src/c.md', status: 'added' }];
+
+    const pull = await run('pull', dir, githubEnv());
+    expect(pull.code).toBe(0);
+    expect(readFileSync(join(dir, 'vendor/c.md'), 'utf-8')).toBe('my precious local file\n');
+    expect(pull.stdout).toContain('added upstream, file exists locally');
+
+    // The skip defers the version so the change stays applicable later
+    const manifest = JSON.parse(readFileSync(join(dir, 'trackcn.json'), 'utf-8'));
+    expect(manifest.sources[0].version).toBe('sha-v1');
+
+    const forced = await run('pull --force', dir, githubEnv());
+    expect(forced.code).toBe(0);
+    expect(readFileSync(join(dir, 'vendor/c.md'), 'utf-8')).toBe('ccc v1\n');
+    const after = JSON.parse(readFileSync(join(dir, 'trackcn.json'), 'utf-8'));
+    expect(after.sources[0].version).toBe('sha-v2');
+  });
+
+  it('rejects gist filenames that decode to drive-letter paths', async () => {
+    const { code, stderr } = await run('add https://gist.github.com/user/deadbeefdeadbeefdead', dir, githubEnv());
+    expect(code).not.toBe(0);
+    expect(stderr).toContain('must stay within');
+    expect(existsSync(join(dir, 'C:'))).toBe(false);
+    expect(existsSync(join(dir, 'trackcn.json'))).toBe(false);
+  });
+
+  it('rate-limit errors point at GITHUB_TOKEN, not at the unavailable browser login', async () => {
+    const add = await run('add https://github.com/acme/widgets/blob/main/docs/AGENTS.md ./notes', dir, githubEnv());
+    expect(add.code).toBe(0);
+
+    headSha = 'sha-v2';
+    failContentsWith403 = true;
+
+    const pull = await run('pull', dir, githubEnv());
+    expect(pull.code).toBe(1);
+    expect(pull.stdout + pull.stderr).toContain('rate limit');
+    expect(pull.stdout + pull.stderr).toContain('GITHUB_TOKEN');
+    expect(pull.stdout + pull.stderr).not.toContain('auth login');
+  });
+
+  it('one failing source does not abort the rest of the pull', async () => {
+    // Two sources: the failing single file, and a healthy directory
+    await run('add https://github.com/acme/widgets/blob/main/docs/AGENTS.md ./notes', dir, githubEnv());
+    await run('add https://github.com/acme/widgets/tree/main/src ./vendor', dir, githubEnv());
+
+    headSha = 'sha-v2';
+    contentByRef = { 'sha-v1': 'hello v1\n', 'sha-v2': 'hello v2\n', main: 'hello v2\n' };
+    failContentsWith403 = true; // only affects docs/AGENTS.md
+    dirFiles = { 'src/a.md': 'aaa v2\n', 'src/b.md': 'bbb v1\n' };
+    compareFiles = [{ filename: 'src/a.md', status: 'modified', patch: '@@ -1 +1 @@\n-aaa v1\n+aaa v2' }];
+
+    const pull = await run('pull --json', dir, githubEnv());
+    expect(pull.code).toBe(1); // errors reported
+    const out = JSON.parse(pull.stdout);
+    expect(out.errors.length).toBe(1);
+    // The healthy source still updated
+    expect(readFileSync(join(dir, 'vendor/a.md'), 'utf-8')).toBe('aaa v2\n');
+  });
+
+  it('announces post-pull hooks on stderr in --json mode', async () => {
+    const add = await run(['add', 'https://github.com/acme/widgets/blob/main/docs/AGENTS.md', './notes', '--post-pull', 'echo hook-ok'], dir, githubEnv());
+    expect(add.code).toBe(0);
+
+    headSha = 'sha-v2';
+    contentByRef = { 'sha-v1': 'hello v1\n', 'sha-v2': 'hello v2\n', main: 'hello v2\n' };
+
+    const pull = await run('pull --json', dir, githubEnv());
+    expect(pull.code).toBe(0);
+    expect(pull.stderr).toContain('Running post-pull hook: echo hook-ok');
+    expect(JSON.parse(pull.stdout).hooksRun).toEqual(['echo hook-ok']);
+  });
+});

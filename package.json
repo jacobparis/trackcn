@@ -1,6 +1,6 @@
 {
   "name": "trackcn",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "description": "Track GitHub files, directories, commits, pull requests, and agent skills like dependencies.",
   "type": "module",
   "main": "./dist/index.js",
@@ -51,7 +51,8 @@
     "access": "public"
   },
   "dependencies": {
-    "arg": "^5.0.2"
+    "arg": "^5.0.2",
+    "diff": "^8.0.4"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

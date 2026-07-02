@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   parseUrl, canonicalUrl, contentHash, isLocalPath, lastPathSegment,
-  hasMergeMarker, cleanDiff, prependMergeMarker, MERGE_START, MERGE_END,
+  hasMergeMarker, cleanDiff, prependMergeMarker, addMergeMarker, unifiedDiff, MERGE_START, MERGE_END,
   categorizeFile, decodeGistFilename, sortFiles, getPatchOrder,
   type ParsedSource, type ParsedRepo, type SourceFile,
 } from './lib.js';
@@ -460,5 +460,48 @@ describe('sortFiles', () => {
     expect(sorted[0].patchOrder).toBe(1);
     expect(sorted[1].patchOrder).toBe(2);
     expect(sorted[2].patchOrder).toBe(3);
+  });
+});
+
+describe('unifiedDiff', () => {
+  it('produces diff -u style hunks', () => {
+    const diff = unifiedDiff('one\ntwo\n', 'one\nthree\n');
+    expect(diff).toContain('@@ -1,2 +1,2 @@');
+    expect(diff).toContain('-two');
+    expect(diff).toContain('+three');
+  });
+
+  it('returns empty string for identical content', () => {
+    expect(unifiedDiff('same\n', 'same\n')).toBe('');
+  });
+});
+
+describe('cleanDiff content preservation', () => {
+  it('keeps removed content lines that start with ---', () => {
+    const diff = '--- old\n+++ new\n@@ -1,2 +1,1 @@\n---i;\n line\n';
+    const cleaned = cleanDiff(diff);
+    expect(cleaned).toContain('---i;');
+    expect(cleaned).not.toContain('--- old');
+    expect(cleaned).not.toContain('+++ new');
+  });
+});
+
+describe('addMergeMarker', () => {
+  it('stacks a block for a new distinct upstream change', () => {
+    const first = addMergeMarker('local code', '@@ -1 +1 @@\n-v1\n+v2');
+    expect(first.added).toBe(true);
+    const second = addMergeMarker(first.content, '@@ -1 +1 @@\n-v2\n+v3');
+    expect(second.added).toBe(true);
+    expect((second.content.match(new RegExp(MERGE_START, 'g')) || []).length).toBe(2);
+    expect(second.content).toContain('+v2');
+    expect(second.content).toContain('+v3');
+    expect(second.content).toContain('local code');
+  });
+
+  it('does not duplicate an identical block', () => {
+    const first = addMergeMarker('local code', '@@ -1 +1 @@\n-v1\n+v2');
+    const again = addMergeMarker(first.content, '@@ -1 +1 @@\n-v1\n+v2');
+    expect(again.added).toBe(false);
+    expect(again.content).toBe(first.content);
   });
 });

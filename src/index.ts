@@ -11,7 +11,7 @@ import { fileURLToPath } from 'url';
 import {
   type FileType, type FileContent, type SourceFile, type ParsedSource, type ParsedRepo,
   categorizeFile, getPatchOrder, contentHash, decodeFetchedContent, asText, decodeGistFilename, sortFiles,
-  MERGE_START, MERGE_END, hasMergeMarker, cleanDiff, prependMergeMarker,
+  MERGE_START, MERGE_END, hasMergeMarker, cleanDiff, prependMergeMarker, addMergeMarker, unifiedDiff,
   parseUrl, canonicalUrl, isLocalPath, lastPathSegment,
 } from './lib.js';
 
@@ -122,8 +122,9 @@ async function fetchGitHubDeviceJson(path: string, body: URLSearchParams): Promi
 async function loginWithGitHubApp(reason?: string): Promise<GitHubAuth> {
   if (!GITHUB_CLIENT_ID) {
     throw new Error(
-      `GitHub authentication is required${reason ? ` (${reason})` : ''}, but this trackcn build does not have a GitHub App client id configured.\n` +
-      'Set TRACKCN_GITHUB_CLIENT_ID to the GitHub App OAuth client id, or set TRACKCN_GITHUB_TOKEN.'
+      `GitHub authentication is required${reason ? ` (${reason})` : ''}.\n` +
+      'Set GITHUB_TOKEN (or TRACKCN_GITHUB_TOKEN) to a GitHub token.\n' +
+      'Browser login (`trackcn auth login`) is only available when TRACKCN_GITHUB_CLIENT_ID is set to a GitHub App OAuth client id.'
     );
   }
 
@@ -187,20 +188,39 @@ function isAuthRecoverableStatus(status: number): boolean {
   return status === 401 || status === 403 || status === 404;
 }
 
+// The browser login flow only exists on builds configured with a GitHub App
+// client id — without one, errors point at token env vars instead.
+function githubAuthHint(): string {
+  if (getGitHubAuth()) return '';
+  const login = GITHUB_CLIENT_ID ? ', or run `trackcn auth login`' : '';
+  return `\nSet GITHUB_TOKEN (or TRACKCN_GITHUB_TOKEN)${login} for authenticated GitHub access.`;
+}
+
+function githubErrorFromStatus(response: Response, url: string): Error {
+  if (response.status === 404) {
+    return new Error(`Not found: ${url}${getGitHubAuth() ? '' : `\nIf this repository is private, authentication is required.${githubAuthHint()}`}`);
+  }
+  if (response.status === 403 || response.status === 429) {
+    if (response.headers.get('x-ratelimit-remaining') === '0') {
+      return new Error(`GitHub rate limit exceeded${getGitHubAuth() ? '' : ' (unauthenticated requests are limited to 60/hour)'}.${githubAuthHint() || ' Try again later.'}`);
+    }
+    return new Error(`GitHub request forbidden (${response.status}).${githubAuthHint()}`);
+  }
+  return new Error(`GitHub API error: ${response.status} ${response.statusText}`);
+}
+
 async function githubFetch(url: string, allowLogin = true): Promise<Response> {
   const headers: Record<string, string> = { ...GITHUB_HEADERS, ...githubAuthHeaders() };
   const start = Date.now();
   const response = await fetch(url, { headers });
   const ms = Date.now() - start;
   await trace('api:github', { url, status: response.status, ms });
-  if (!response.ok && allowLogin && isAuthRecoverableStatus(response.status) && !getGitHubAuth()) {
+  if (!response.ok && allowLogin && GITHUB_CLIENT_ID && isAuthRecoverableStatus(response.status) && !getGitHubAuth()) {
     await loginWithGitHubApp(response.status === 404 ? 'GitHub returned 404 for a repository that may be private' : `GitHub returned ${response.status}`);
     return githubFetch(url, false);
   }
   if (!response.ok) {
-    if (response.status === 404) throw new Error(`Not found: ${url}${getGitHubAuth() ? '' : '\nAuthentication may be required. Run `trackcn auth login` or set TRACKCN_GITHUB_TOKEN.'}`);
-    if (response.status === 403) throw new Error(`GitHub request forbidden. Run \`trackcn auth login\` or set TRACKCN_GITHUB_TOKEN.`);
-    throw new Error(`GitHub API error: ${response.status} ${response.statusText}`);
+    throw githubErrorFromStatus(response, url);
   }
   return response;
 }
@@ -208,12 +228,12 @@ async function githubFetch(url: string, allowLogin = true): Promise<Response> {
 async function githubDownload(url: string, allowLogin = true): Promise<Response> {
   const headers: Record<string, string> = githubAuthHeaders();
   const response = await fetch(url, { headers });
-  if (!response.ok && allowLogin && isAuthRecoverableStatus(response.status) && !getGitHubAuth()) {
+  if (!response.ok && allowLogin && GITHUB_CLIENT_ID && isAuthRecoverableStatus(response.status) && !getGitHubAuth()) {
     await loginWithGitHubApp(`GitHub download returned ${response.status}`);
     return githubDownload(url, false);
   }
   if (!response.ok) {
-    throw new Error(`GitHub download error: ${response.status} ${response.statusText}`);
+    throw new Error(`GitHub download error: ${response.status} ${response.statusText}${githubAuthHint()}`);
   }
   return response;
 }
@@ -486,9 +506,15 @@ async function tryLoadRegistryItems(owner: string, repo: string, ref: string): P
   }
 }
 
+// posix.isAbsolute does not reject Windows drive-letter paths (C:/...), which
+// the platform path module would treat as absolute at write time.
+function hasDrivePrefix(value: string): boolean {
+  return /^[A-Za-z]:/.test(value);
+}
+
 function normalizeRegistryTarget(target: string): string {
   const normalized = posix.normalize(target.replace(/\\/g, '/').replace(/^~\//, '').replace(/^\.\//, ''));
-  if (normalized === '..' || normalized.startsWith('../') || posix.isAbsolute(normalized)) {
+  if (normalized === '..' || normalized.startsWith('../') || posix.isAbsolute(normalized) || hasDrivePrefix(normalized)) {
     throw new Error(`Registry target must stay within the project: ${target}`);
   }
   return normalized;
@@ -613,7 +639,7 @@ function targetPath(rootDir: string, target: string): string {
 
 function normalizeSourceTarget(target: string): string {
   const normalized = posix.normalize(target.replace(/\\/g, '/'));
-  if (!normalized || normalized === '.' || normalized === '..' || normalized.startsWith('../') || posix.isAbsolute(normalized)) {
+  if (!normalized || normalized === '.' || normalized === '..' || normalized.startsWith('../') || posix.isAbsolute(normalized) || hasDrivePrefix(normalized)) {
     throw new Error(`Source file target must stay within its source: ${target}`);
   }
   return normalized;
@@ -642,7 +668,7 @@ function findSource(manifest: RepocnManifest, url: string, prefix: string): Repo
 
 function normalizeManifestPath(value: string): string {
   const normalized = posix.normalize(value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, ''));
-  if (!normalized || normalized === '.' || normalized === '..' || normalized.startsWith('../') || posix.isAbsolute(normalized)) {
+  if (!normalized || normalized === '.' || normalized === '..' || normalized.startsWith('../') || posix.isAbsolute(normalized) || hasDrivePrefix(normalized)) {
     throw new Error(`Path must stay within the project: ${value}`);
   }
   return normalized;
@@ -772,7 +798,7 @@ async function trace(event: string, data?: Record<string, unknown>): Promise<voi
 // CLI: arg parsing
 // ============================================================================
 
-const VERSION = '0.5.2';
+const VERSION = '0.6.0';
 
 function showHelp() {
   console.log(`
@@ -1508,8 +1534,9 @@ async function cmdAdd(positional: string[]) {
                 written.push(relativePath);
               }
             } else if (cf.patch && diskText !== null) {
-              await writeFile(fullPath, prependMergeMarker(diskText, cf.patch));
               const rawFiles = await fetchRepoFiles(changesetOwner, changesetRepo, cf.filename, version);
+              const marked = addMergeMarker(diskText, cf.patch);
+              if (marked.added) await writeFile(fullPath, marked.content);
               sourceEntry.files[relativePath] = rawFiles.length > 0 ? contentHash(rawFiles[0].content) : diskHash;
               merged.push(relativePath);
             } else if (cf.patch) {
@@ -1539,6 +1566,15 @@ async function cmdAdd(positional: string[]) {
           const oldPath = targetPath(rootDir, oldRelative);
           const newPath = fullPath;
 
+          if (oldPath !== newPath && existsSync(newPath) && !force) {
+            const targetStored = sourceEntry.files[relativePath];
+            const targetHash = contentHash(await readFile(newPath));
+            if (!targetStored || targetHash !== targetStored) {
+              skippedAdd.push(`${relativePath} (rename target exists locally, use --force to overwrite)`);
+              continue;
+            }
+          }
+
           if (existsSync(oldPath)) {
             const diskContent = await readFile(oldPath);
             const storedHash = sourceEntry.files[oldRelative];
@@ -1550,10 +1586,10 @@ async function cmdAdd(positional: string[]) {
             if (cf.patch && userModified && !force && diskText === null) {
               skippedAdd.push(`${oldRelative} (binary file conflict, use --force to overwrite)`);
             } else if (cf.patch && userModified && !force) {
-              await writeFile(newPath, prependMergeMarker(diskText!, cf.patch));
+              const rawFiles = await fetchRepoFiles(changesetOwner, changesetRepo, cf.filename, version);
+              await writeFile(newPath, addMergeMarker(diskText!, cf.patch).content);
               if (oldPath !== newPath) await unlink(oldPath);
               delete sourceEntry.files[oldRelative];
-              const rawFiles = await fetchRepoFiles(changesetOwner, changesetRepo, cf.filename, version);
               sourceEntry.files[relativePath] = rawFiles.length > 0 ? contentHash(rawFiles[0].content) : contentHash(diskContent);
               renamed.push(`${oldRelative} -> ${relativePath}`);
               merged.push(relativePath);
@@ -1664,15 +1700,16 @@ async function cmdAdd(positional: string[]) {
               skippedAdd.push(`${file.target} (binary file conflict, use --force to overwrite)`);
               continue;
             }
-            // User modified — merge marker
-            const td = join(tmpdir(), `trackcn-diff-${randomUUID()}`);
-            await mkdir(td, { recursive: true });
-            await writeFile(join(td, 'old'), diskText);
-            await writeFile(join(td, 'new'), newText);
-            let diff: string;
-            try {
-              diff = execSync(`diff -u "${join(td, 'old')}" "${join(td, 'new')}" || true`, { encoding: 'utf-8' });
-            } catch { diff = '(diff failed)\n'; }
+            if (hasMergeMarker(diskText)) {
+              // A clean diff can't be computed against a file that still holds
+              // an unresolved marker block — resolve first, then re-add.
+              await trace('add:file:skip', { path: file.target, reason: 'unresolved_merge' });
+              skippedAdd.push(`${file.target} (unresolved merge markers, resolve them first)`);
+              continue;
+            }
+            // User modified — merge marker (base is the local file: at add
+            // time there is no recorded old upstream version to diff from)
+            const diff = DISK_BASE_NOTE + unifiedDiff(diskText, newText);
             await writeFile(fullPath, prependMergeMarker(diskText, diff));
             sourceEntry.files[file.target] = newHash;
             await trace('add:file:merge', { path: file.target });
@@ -1760,18 +1797,6 @@ interface PullResults {
   merged: string[];
 }
 
-async function createContentDiff(oldContent: string, newContent: string): Promise<string> {
-  const td = join(tmpdir(), `trackcn-diff-${randomUUID()}`);
-  await mkdir(td, { recursive: true });
-  await writeFile(join(td, 'old'), oldContent);
-  await writeFile(join(td, 'new'), newContent);
-  try {
-    return execSync(`diff -u "${join(td, 'old')}" "${join(td, 'new')}" || true`, { encoding: 'utf-8' });
-  } catch {
-    return '(diff failed)\n';
-  }
-}
-
 async function syncRefetchedFiles({
   rootDir,
   sourceEntry,
@@ -1779,6 +1804,7 @@ async function syncRefetchedFiles({
   force,
   dryRun,
   results,
+  getOldText,
 }: {
   rootDir: string;
   sourceEntry: RepocnSource;
@@ -1786,8 +1812,13 @@ async function syncRefetchedFiles({
   force: boolean;
   dryRun: boolean;
   results: PullResults;
-}): Promise<boolean> {
+  // Returns the upstream content of a target at the source's recorded version,
+  // so merge markers can carry the pure upstream diff (old -> new) instead of
+  // a disk -> new diff that would present local edits as removals.
+  getOldText?: (target: string) => Promise<string | null>;
+}): Promise<{ anyChanges: boolean; deferred: boolean }> {
   let anyChanges = false;
+  let deferred = false;
   const write = dryRun ? async (_path: string, _content: FileContent) => {} : writeFile;
   const remove = dryRun ? async (_path: string) => {} : unlink;
   const ensureDir = dryRun ? async (_path: string) => {} : (path: string) => mkdir(path, { recursive: true });
@@ -1841,6 +1872,7 @@ async function syncRefetchedFiles({
 
     if (!storedHash && !force) {
       results.skipped.push(`${file.target} (added upstream, file exists locally)`);
+      deferred = true;
       continue;
     }
 
@@ -1856,19 +1888,75 @@ async function syncRefetchedFiles({
       const diskText = asText(diskContent);
       const newText = asText(file.content);
       if (diskText === null || newText === null) {
-        // Never splice merge markers into binary files — skip with a warning.
+        // Never splice merge markers into binary files — skip with a warning
+        // and keep the old version so the change stays visible to later pulls.
         results.skipped.push(`${file.target} (binary file conflict, use --force to overwrite)`);
+        deferred = true;
         continue;
       }
-      const diff = await createContentDiff(diskText, newText);
-      await write(fullPath, prependMergeMarker(diskText, diff));
+      const oldText = getOldText ? await getOldText(file.target) : null;
+      if (oldText === null && hasMergeMarker(diskText)) {
+        // Without old upstream content the diff base is the disk file, and the
+        // disk file still holds an unresolved marker block — defer so the next
+        // pull retries after the user resolves it.
+        results.skipped.push(`${file.target} (unresolved merge markers, resolve and pull again)`);
+        deferred = true;
+        continue;
+      }
+      const diff = oldText === null
+        ? DISK_BASE_NOTE + unifiedDiff(diskText, newText)
+        : unifiedDiff(oldText, newText);
+      const marked = addMergeMarker(diskText, diff);
+      if (marked.added) {
+        await write(fullPath, marked.content);
+        results.merged.push(file.target);
+        anyChanges = true;
+      }
       sourceEntry.files[file.target] = newHash;
-      results.merged.push(file.target);
-      anyChanges = true;
     }
   }
 
-  return anyChanges;
+  return { anyChanges, deferred };
+}
+
+// When no old upstream content is available the marker diff is computed
+// against the local file, so removed lines may be local edits rather than
+// upstream removals — say so inside the block.
+const DISK_BASE_NOTE = '(diff base: local file — upstream history unavailable; removed lines may be local edits)\n';
+
+// Upstream 'added' a file that may already exist locally — never clobber an
+// untracked or locally-modified file without --force.
+async function writeUpstreamAddedFile({
+  fullPath, relativePath, content, sourceEntry, force, results, write, ensureDir,
+}: {
+  fullPath: string;
+  relativePath: string;
+  content: FileContent;
+  sourceEntry: RepocnSource;
+  force: boolean;
+  results: PullResults;
+  write: (path: string, content: FileContent) => Promise<unknown>;
+  ensureDir: (path: string) => Promise<unknown>;
+}): Promise<{ changed: boolean; skipped: boolean }> {
+  const newHash = contentHash(content);
+  if (existsSync(fullPath) && !force) {
+    const diskHash = contentHash(await readFile(fullPath));
+    if (diskHash === newHash) {
+      // Content already present — adopt tracking without writing.
+      sourceEntry.files[relativePath] = newHash;
+      return { changed: false, skipped: false };
+    }
+    const storedHash = sourceEntry.files[relativePath];
+    if (!storedHash || diskHash !== storedHash) {
+      results.skipped.push(`${relativePath} (added upstream, file exists locally)`);
+      return { changed: false, skipped: true };
+    }
+  }
+  await ensureDir(dirname(fullPath));
+  await write(fullPath, content);
+  sourceEntry.files[relativePath] = newHash;
+  results.added.push(relativePath);
+  return { changed: true, skipped: false };
 }
 
 async function cmdPull() {
@@ -1927,15 +2015,43 @@ async function cmdPull() {
             for (const file of bundle.files) file.target = join(prefix, file.target);
           }
 
-          anyChanges = await syncRefetchedFiles({
+          // Old bundle content at the recorded version, resolved lazily and at
+          // most once, so merge markers can carry the pure upstream diff.
+          let oldBundleByTarget: Map<string, string | null> | null | undefined;
+          const getOldText = async (target: string): Promise<string | null> => {
+            if (oldBundleByTarget === undefined) {
+              try {
+                const oldBundle = await resolveRegistryBundle(
+                  rootDir,
+                  sourceEntry.owner,
+                  sourceEntry.repo,
+                  sourceEntry.version,
+                  sourceEntry.item,
+                );
+                oldBundleByTarget = oldBundle
+                  ? new Map(oldBundle.files.map((file) => [
+                      prefix ? join(prefix, file.target) : file.target,
+                      asText(file.content),
+                    ]))
+                  : null;
+              } catch {
+                oldBundleByTarget = null;
+              }
+            }
+            return oldBundleByTarget?.get(target) ?? null;
+          };
+
+          const sync = await syncRefetchedFiles({
             rootDir,
             sourceEntry,
             files: bundle.files,
             force,
             dryRun,
             results,
+            getOldText,
           });
-          sourceEntry.version = latestSha;
+          anyChanges = sync.anyChanges;
+          if (!sync.deferred) sourceEntry.version = latestSha;
           sourceEntry.requirements = bundle.requirements;
         } catch (error) {
           const message = (error as Error).message;
@@ -1944,6 +2060,7 @@ async function cmdPull() {
           continue;
         }
       } else {
+        try {
         const parsed = parseUrl(sourceEntry.url);
 
       if (parsed.type === 'raw') {
@@ -1966,6 +2083,7 @@ async function cmdPull() {
         if (newHash === sourceEntry.version) continue;
 
         // Single file — check each tracked file
+        let rawDeferred = false;
         for (const [filePath, storedHash] of Object.entries(sourceEntry.files)) {
           const fullPath = targetPath(rootDir, filePath);
           if (!existsSync(fullPath)) {
@@ -1990,16 +2108,18 @@ async function cmdPull() {
               const newText = asText(content);
               if (diskText === null || newText === null) {
                 results.skipped.push(`${filePath} (binary file conflict, use --force to overwrite)`);
+                rawDeferred = true;
                 continue;
               }
-              const td = join(tmpdir(), `trackcn-diff-${randomUUID()}`);
-              await mkdir(td, { recursive: true });
-              await writeFile(join(td, 'old'), diskText);
-              await writeFile(join(td, 'new'), newText);
-              let diff: string;
-              try {
-                diff = execSync(`diff -u "${join(td, 'old')}" "${join(td, 'new')}" || true`, { encoding: 'utf-8' });
-              } catch { diff = '(diff failed)\n'; }
+              if (hasMergeMarker(diskText)) {
+                // Raw URLs have no history, so the diff base is the disk file —
+                // unusable while an unresolved marker block is present. Defer
+                // (keep the old version) so the next pull retries.
+                results.skipped.push(`${filePath} (unresolved merge markers, resolve and pull again)`);
+                rawDeferred = true;
+                continue;
+              }
+              const diff = DISK_BASE_NOTE + unifiedDiff(diskText, newText);
               await write(fullPath, prependMergeMarker(diskText, diff));
               sourceEntry.files[filePath] = newHash;
               results.merged.push(filePath);
@@ -2008,7 +2128,7 @@ async function cmdPull() {
           }
         }
 
-        sourceEntry.version = newHash;
+        if (!rawDeferred) sourceEntry.version = newHash;
 
       } else if (parsed.type === 'repo') {
         const latestSha = await resolveRepoHeadSha(parsed.owner, parsed.repo, parsed.ref);
@@ -2027,9 +2147,13 @@ async function cmdPull() {
           try {
             // Fetch at the resolved head so content matches the recorded version
             rawFiles = await fetchRepoFiles(parsed.owner, parsed.repo, parsed.path, latestSha);
-          } catch {
-            // Path gone upstream (deleted or renamed) — sync against empty
-            // upstream: unmodified tracked files delete, modified ones skip.
+          } catch (error) {
+            // Only an explicit 404 means the path is gone upstream (deleted or
+            // renamed) — then syncing against an empty upstream is correct:
+            // unmodified tracked files delete, modified ones skip. Any other
+            // failure (rate limit, network) must abort the source, or the
+            // empty result would be read as "everything deleted upstream".
+            if (!(error as Error).message.startsWith('Not found:')) throw error;
             if (!json) console.log(`    (path not found upstream — removed or renamed)`);
           }
           if (parsed.startLine && rawFiles.length === 1 && typeof rawFiles[0].content === 'string') {
@@ -2037,14 +2161,42 @@ async function cmdPull() {
             rawFiles[0].content = lines.slice(parsed.startLine - 1, parsed.endLine || parsed.startLine).join('\n') + '\n';
           }
           const files = repoFilesToSourceFiles(rawFiles, parsed.path);
-          if (rawFiles.length === 1 && rawFiles[0].path === parsed.path && trackedKeys.length === 1) {
+          const isSingleFile = rawFiles.length === 1 && rawFiles[0].path === parsed.path && trackedKeys.length === 1;
+          if (isSingleFile) {
             // True single file: keep the tracked destination (supports file renames on add)
             files[0].target = trackedKeys[0];
           } else {
             for (const file of files) file.target = withDestination(sourceEntry.prefix || '', file.target);
           }
-          anyChanges = await syncRefetchedFiles({ rootDir, sourceEntry, files, force, dryRun, results });
-          sourceEntry.version = latestSha;
+
+          const oldVersion = sourceEntry.version;
+          const getOldText = async (target: string): Promise<string | null> => {
+            if (!oldVersion) return null;
+            try {
+              let upstreamPath: string;
+              if (isSingleFile) {
+                upstreamPath = parsed.path;
+              } else {
+                const destPrefix = sourceEntry.prefix || '';
+                const rel = destPrefix && target.startsWith(`${destPrefix}/`) ? target.slice(destPrefix.length + 1) : target;
+                upstreamPath = parsed.path ? `${parsed.path}/${rel}` : rel;
+              }
+              const old = await fetchRepoFiles(parsed.owner, parsed.repo, upstreamPath, oldVersion, false);
+              if (old.length !== 1) return null;
+              let text = asText(old[0].content);
+              if (text !== null && parsed.startLine) {
+                const lines = text.split('\n');
+                text = lines.slice(parsed.startLine - 1, parsed.endLine || parsed.startLine).join('\n') + '\n';
+              }
+              return text;
+            } catch {
+              return null;
+            }
+          };
+
+          const sync = await syncRefetchedFiles({ rootDir, sourceEntry, files, force, dryRun, results, getOldText });
+          anyChanges = sync.anyChanges;
+          if (!sync.deferred) sourceEntry.version = latestSha;
           if (anyChanges && sourceEntry['post-pull']) hooksToRun.push(sourceEntry['post-pull']);
         };
 
@@ -2078,6 +2230,11 @@ async function cmdPull() {
           (f) => f.filename.startsWith(prefix) || (f.previous_filename && f.previous_filename.startsWith(prefix))
         );
 
+        // Skips that leave an upstream change unapplied (collisions, binary
+        // conflicts) keep the old version so later pulls — including
+        // `pull --force` — can still apply it.
+        let sourceDeferred = false;
+
         for (const cf of relevantFiles) {
           const sourceRelativePath = cf.filename.startsWith(prefix) ? cf.filename.slice(prefix.length) : cf.filename;
           const relativePath = withDestination(sourceEntry.prefix || '', sourceRelativePath);
@@ -2087,11 +2244,9 @@ async function cmdPull() {
             const rawFiles = await fetchRepoFiles(parsed.owner, parsed.repo, cf.filename, latestSha);
             if (rawFiles.length > 0) {
               const fullPath = targetPath(rootDir, relativePath);
-              await ensureDir(dirname(fullPath));
-              await write(fullPath, rawFiles[0].content);
-              sourceEntry.files[relativePath] = contentHash(rawFiles[0].content);
-              results.added.push(relativePath);
-              anyChanges = true;
+              const added = await writeUpstreamAddedFile({ fullPath, relativePath, content: rawFiles[0].content, sourceEntry, force, results, write, ensureDir });
+              if (added.changed) anyChanges = true;
+              if (added.skipped) sourceDeferred = true;
             }
           } else if (cf.status === 'removed') {
             const fullPath = targetPath(rootDir, relativePath);
@@ -2117,6 +2272,16 @@ async function cmdPull() {
             const oldPath = targetPath(rootDir, oldRelative);
             const newPath = targetPath(rootDir, relativePath);
 
+            if (oldPath !== newPath && existsSync(newPath) && !force) {
+              const targetStored = sourceEntry.files[relativePath];
+              const targetHash = contentHash(await readFile(newPath));
+              if (!targetStored || targetHash !== targetStored) {
+                results.skipped.push(`${relativePath} (rename target exists locally, use --force to overwrite)`);
+                sourceDeferred = true;
+                continue;
+              }
+            }
+
             if (existsSync(oldPath)) {
               const diskContent = await readFile(oldPath);
               const storedHash = sourceEntry.files[oldRelative];
@@ -2127,12 +2292,14 @@ async function cmdPull() {
 
               if (cf.patch && userModified && !force && diskText === null) {
                 results.skipped.push(`${oldRelative} (binary file conflict, use --force to overwrite)`);
+                sourceDeferred = true;
               } else if (cf.patch && userModified && !force) {
-                const marked = prependMergeMarker(diskText!, cf.patch);
-                await write(newPath, marked);
+                // Fetch before writing the marker so a failed fetch can't leave
+                // a marker on disk with a stale manifest.
+                const rawFiles = await fetchRepoFiles(parsed.owner, parsed.repo, cf.filename, latestSha);
+                await write(newPath, addMergeMarker(diskText!, cf.patch).content);
                 if (oldPath !== newPath) await remove(oldPath);
                 delete sourceEntry.files[oldRelative];
-                const rawFiles = await fetchRepoFiles(parsed.owner, parsed.repo, cf.filename, latestSha);
                 sourceEntry.files[relativePath] = rawFiles.length > 0 ? contentHash(rawFiles[0].content) : contentHash(diskContent);
                 results.renamed.push(`${oldRelative} -> ${relativePath}`);
                 results.merged.push(relativePath);
@@ -2186,14 +2353,19 @@ async function cmdPull() {
                 const diskText = asText(await readFile(fullPath));
                 if (diskText === null) {
                   results.skipped.push(`${relativePath} (binary file conflict, use --force to overwrite)`);
+                  sourceDeferred = true;
                   continue;
                 }
-                const marked = prependMergeMarker(diskText, cf.patch);
-                await write(fullPath, marked);
+                // Fetch before writing the marker so a failed fetch can't leave
+                // a marker on disk with a stale manifest.
                 const rawFiles = await fetchRepoFiles(parsed.owner, parsed.repo, cf.filename, latestSha);
+                const marked = addMergeMarker(diskText, cf.patch);
+                if (marked.added) {
+                  await write(fullPath, marked.content);
+                  results.merged.push(relativePath);
+                  anyChanges = true;
+                }
                 sourceEntry.files[relativePath] = rawFiles.length > 0 ? contentHash(rawFiles[0].content) : storedHash;
-                results.merged.push(relativePath);
-                anyChanges = true;
               } else {
                 results.skipped.push(relativePath);
               }
@@ -2201,7 +2373,7 @@ async function cmdPull() {
           }
         }
 
-        sourceEntry.version = latestSha;
+        if (!sourceDeferred) sourceEntry.version = latestSha;
 
       } else if (parsed.type === 'commit') {
         // --- Commit: immutable, nothing to pull ---
@@ -2224,6 +2396,7 @@ async function cmdPull() {
           errors.push({ source: sourceEntry.url, error: 'compare reports 300 changed files (GitHub truncates at 300) — skipping to avoid a partial update. Narrow the range or re-add the source.' });
           continue;
         }
+        let sourceDeferred = false;
         for (const cf of compare.files) {
           const relativePath = withDestination(sourceEntry.prefix || '', cf.filename);
           if (isIgnored(sourceEntry, relativePath)) continue;
@@ -2232,11 +2405,9 @@ async function cmdPull() {
           if (cf.status === 'added') {
             const rawFiles = await fetchRepoFiles(parsed.owner, parsed.repo, cf.filename, latestHead);
             if (rawFiles.length > 0) {
-              await ensureDir(dirname(fullPath));
-              await write(fullPath, rawFiles[0].content);
-              sourceEntry.files[relativePath] = contentHash(rawFiles[0].content);
-              results.added.push(relativePath);
-              anyChanges = true;
+              const added = await writeUpstreamAddedFile({ fullPath, relativePath, content: rawFiles[0].content, sourceEntry, force, results, write, ensureDir });
+              if (added.changed) anyChanges = true;
+              if (added.skipped) sourceDeferred = true;
             }
           } else if (cf.status === 'removed') {
             const storedHash = sourceEntry.files[relativePath];
@@ -2256,6 +2427,16 @@ async function cmdPull() {
             const oldPath = targetPath(rootDir, oldRelative);
             const newPath = fullPath;
 
+            if (oldPath !== newPath && existsSync(newPath) && !force) {
+              const targetStored = sourceEntry.files[relativePath];
+              const targetHash = contentHash(await readFile(newPath));
+              if (!targetStored || targetHash !== targetStored) {
+                results.skipped.push(`${relativePath} (rename target exists locally, use --force to overwrite)`);
+                sourceDeferred = true;
+                continue;
+              }
+            }
+
             if (existsSync(oldPath)) {
               const diskContent = await readFile(oldPath);
               const storedHash = sourceEntry.files[oldRelative];
@@ -2266,11 +2447,12 @@ async function cmdPull() {
 
               if (cf.patch && userModified && !force && diskText === null) {
                 results.skipped.push(`${oldRelative} (binary file conflict, use --force to overwrite)`);
+                sourceDeferred = true;
               } else if (cf.patch && userModified && !force) {
-                await write(newPath, prependMergeMarker(diskText!, cf.patch));
+                const rawFiles = await fetchRepoFiles(parsed.owner, parsed.repo, cf.filename, latestHead);
+                await write(newPath, addMergeMarker(diskText!, cf.patch).content);
                 if (oldPath !== newPath) await remove(oldPath);
                 delete sourceEntry.files[oldRelative];
-                const rawFiles = await fetchRepoFiles(parsed.owner, parsed.repo, cf.filename, latestHead);
                 sourceEntry.files[relativePath] = rawFiles.length > 0 ? contentHash(rawFiles[0].content) : contentHash(diskContent);
                 results.renamed.push(`${oldRelative} -> ${relativePath}`);
                 results.merged.push(relativePath);
@@ -2322,13 +2504,17 @@ async function cmdPull() {
                 const diskText = asText(await readFile(fullPath));
                 if (diskText === null) {
                   results.skipped.push(`${relativePath} (binary file conflict, use --force to overwrite)`);
+                  sourceDeferred = true;
                   continue;
                 }
-                await write(fullPath, prependMergeMarker(diskText, cf.patch));
                 const rawFiles = await fetchRepoFiles(parsed.owner, parsed.repo, cf.filename, latestHead);
+                const marked = addMergeMarker(diskText, cf.patch);
+                if (marked.added) {
+                  await write(fullPath, marked.content);
+                  results.merged.push(relativePath);
+                  anyChanges = true;
+                }
                 sourceEntry.files[relativePath] = rawFiles.length > 0 ? contentHash(rawFiles[0].content) : storedHash;
-                results.merged.push(relativePath);
-                anyChanges = true;
               } else {
                 results.skipped.push(relativePath);
               }
@@ -2336,7 +2522,7 @@ async function cmdPull() {
           }
         }
 
-        sourceEntry.version = latestHead;
+        if (!sourceDeferred) sourceEntry.version = latestHead;
 
       } else if (parsed.type === 'pull') {
         // --- Pull request: check for new commits ---
@@ -2351,6 +2537,7 @@ async function cmdPull() {
           errors.push({ source: sourceEntry.url, error: 'compare reports 300 changed files (GitHub truncates at 300) — skipping to avoid a partial update. Narrow the range or re-add the source.' });
           continue;
         }
+        let sourceDeferred = false;
         for (const cf of compare.files) {
           const relativePath = withDestination(sourceEntry.prefix || '', cf.filename);
           if (isIgnored(sourceEntry, relativePath)) continue;
@@ -2359,11 +2546,9 @@ async function cmdPull() {
           if (cf.status === 'added') {
             const rawFiles = await fetchRepoFiles(parsed.owner, parsed.repo, cf.filename, latestHeadSha);
             if (rawFiles.length > 0) {
-              await ensureDir(dirname(fullPath));
-              await write(fullPath, rawFiles[0].content);
-              sourceEntry.files[relativePath] = contentHash(rawFiles[0].content);
-              results.added.push(relativePath);
-              anyChanges = true;
+              const added = await writeUpstreamAddedFile({ fullPath, relativePath, content: rawFiles[0].content, sourceEntry, force, results, write, ensureDir });
+              if (added.changed) anyChanges = true;
+              if (added.skipped) sourceDeferred = true;
             }
           } else if (cf.status === 'removed') {
             const storedHash = sourceEntry.files[relativePath];
@@ -2383,6 +2568,16 @@ async function cmdPull() {
             const oldPath = targetPath(rootDir, oldRelative);
             const newPath = fullPath;
 
+            if (oldPath !== newPath && existsSync(newPath) && !force) {
+              const targetStored = sourceEntry.files[relativePath];
+              const targetHash = contentHash(await readFile(newPath));
+              if (!targetStored || targetHash !== targetStored) {
+                results.skipped.push(`${relativePath} (rename target exists locally, use --force to overwrite)`);
+                sourceDeferred = true;
+                continue;
+              }
+            }
+
             if (existsSync(oldPath)) {
               const diskContent = await readFile(oldPath);
               const storedHash = sourceEntry.files[oldRelative];
@@ -2393,11 +2588,12 @@ async function cmdPull() {
 
               if (cf.patch && userModified && !force && diskText === null) {
                 results.skipped.push(`${oldRelative} (binary file conflict, use --force to overwrite)`);
+                sourceDeferred = true;
               } else if (cf.patch && userModified && !force) {
-                await write(newPath, prependMergeMarker(diskText!, cf.patch));
+                const rawFiles = await fetchRepoFiles(parsed.owner, parsed.repo, cf.filename, latestHeadSha);
+                await write(newPath, addMergeMarker(diskText!, cf.patch).content);
                 if (oldPath !== newPath) await remove(oldPath);
                 delete sourceEntry.files[oldRelative];
-                const rawFiles = await fetchRepoFiles(parsed.owner, parsed.repo, cf.filename, latestHeadSha);
                 sourceEntry.files[relativePath] = rawFiles.length > 0 ? contentHash(rawFiles[0].content) : contentHash(diskContent);
                 results.renamed.push(`${oldRelative} -> ${relativePath}`);
                 results.merged.push(relativePath);
@@ -2449,13 +2645,17 @@ async function cmdPull() {
                 const diskText = asText(await readFile(fullPath));
                 if (diskText === null) {
                   results.skipped.push(`${relativePath} (binary file conflict, use --force to overwrite)`);
+                  sourceDeferred = true;
                   continue;
                 }
-                await write(fullPath, prependMergeMarker(diskText, cf.patch));
                 const rawFiles = await fetchRepoFiles(parsed.owner, parsed.repo, cf.filename, latestHeadSha);
+                const marked = addMergeMarker(diskText, cf.patch);
+                if (marked.added) {
+                  await write(fullPath, marked.content);
+                  results.merged.push(relativePath);
+                  anyChanges = true;
+                }
                 sourceEntry.files[relativePath] = rawFiles.length > 0 ? contentHash(rawFiles[0].content) : storedHash;
-                results.merged.push(relativePath);
-                anyChanges = true;
               } else {
                 results.skipped.push(relativePath);
               }
@@ -2463,7 +2663,7 @@ async function cmdPull() {
           }
         }
 
-        sourceEntry.version = latestHeadSha;
+        if (!sourceDeferred) sourceEntry.version = latestHeadSha;
 
       } else if (parsed.type === 'gist') {
         // --- Gist ---
@@ -2487,6 +2687,7 @@ async function cmdPull() {
         }
 
         // Check for files removed upstream
+        let gistDeferred = false;
         const upstreamTargets = new Set(regular.map((f) => f.target));
         for (const trackedPath of trackedFilePaths(sourceEntry)) {
           if (!upstreamTargets.has(trackedPath)) {
@@ -2549,33 +2750,44 @@ async function cmdPull() {
             // Three-way merge — compute diff from old to new, prepend marker
             const oldFile = oldFiles.find((f) => f.target === file.target);
             const diskText = asText(diskContent);
-            if (oldFile && diskText === null) {
+            const newText = asText(file.content);
+            const oldText = oldFile ? asText(oldFile.content) : null;
+            if (diskText === null || newText === null) {
               results.skipped.push(`${file.target} (binary file conflict, use --force to overwrite)`);
-            } else if (oldFile) {
-              const td = join(tmpdir(), `trackcn-diff-${randomUUID()}`);
-              await mkdir(td, { recursive: true });
-              await writeFile(join(td, 'old'), oldFile.content);
-              await writeFile(join(td, 'new'), file.content);
-              let diff: string;
-              try {
-                diff = execSync(`diff -u "${join(td, 'old')}" "${join(td, 'new')}" || true`, { encoding: 'utf-8' });
-              } catch {
-                diff = `(diff failed)\n`;
-              }
-              await write(fullPath, prependMergeMarker(diskText!, diff));
-              sourceEntry.files[file.target] = newHash;
-              results.merged.push(file.target);
-              anyChanges = true;
+              gistDeferred = true;
+            } else if (oldText === null && hasMergeMarker(diskText)) {
+              // No clean diff base while an unresolved marker block is present —
+              // defer (keep the old version) so the next pull retries.
+              results.skipped.push(`${file.target} (unresolved merge markers, resolve and pull again)`);
+              gistDeferred = true;
             } else {
-              results.skipped.push(file.target);
+              const diff = oldText === null
+                ? DISK_BASE_NOTE + unifiedDiff(diskText, newText)
+                : unifiedDiff(oldText, newText);
+              const marked = addMergeMarker(diskText, diff);
+              if (marked.added) {
+                await write(fullPath, marked.content);
+                results.merged.push(file.target);
+                anyChanges = true;
+              }
+              sourceEntry.files[file.target] = newHash;
             }
           }
         }
 
-        sourceEntry.version = latestVersion;
+        if (!gistDeferred) sourceEntry.version = latestVersion;
       } else {
         throw new Error(`Unsupported source: ${sourceEntry.url}`);
       }
+        } catch (error) {
+          // One failing source must not abort the whole pull — files already
+          // written for this source stay recorded in the manifest, and the
+          // version stays put so the next pull picks up where this one failed.
+          const message = (error as Error).message;
+          errors.push({ source: sourceEntry.url, error: message });
+          if (!json) console.log(`    ERROR: ${message}`);
+          continue;
+        }
       }
 
       if (anyChanges && sourceEntry['post-pull']) {
@@ -2590,9 +2802,12 @@ async function cmdPull() {
     // Run hooks
     if (!dryRun) {
       for (const hook of hooksToRun) {
-        if (!json) console.log(`\n  Running: ${hook}`);
+        // Hooks are shell commands from a possibly cloned manifest — always
+        // announce them (stderr in --json mode so stdout stays parseable).
+        if (!json) console.log(`\n  Running post-pull hook: ${hook}`);
+        else console.error(`Running post-pull hook: ${hook}`);
         try {
-          execSync(hook, { stdio: json ? 'ignore' : 'inherit', cwd: rootDir });
+          execSync(hook, { stdio: json ? ['ignore', 'ignore', 'inherit'] : 'inherit', cwd: rootDir });
         } catch {
           const message = `post-pull hook failed: ${hook}`;
           errors.push({ source: 'post-pull', error: message });

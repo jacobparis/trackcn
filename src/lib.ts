@@ -1,5 +1,6 @@
 import { createHash } from 'crypto';
 import { basename } from 'path';
+import { structuredPatch } from 'diff';
 
 // ============================================================================
 // File Processing
@@ -77,15 +78,44 @@ export function hasMergeMarker(content: string): boolean {
   return content.includes(MERGE_START);
 }
 
+// Strips only the ---/+++ file-header lines that precede the first hunk.
+// Removed content lines inside hunks can also start with `---` (SQL comments,
+// decrement expressions) and must survive.
 export function cleanDiff(diff: string): string {
-  return diff.split('\n').filter((line) =>
+  const lines = diff.split('\n');
+  const firstHunk = lines.findIndex((line) => line.startsWith('@@'));
+  const headerEnd = firstHunk === -1 ? lines.length : firstHunk;
+  const header = lines.slice(0, headerEnd).filter((line) =>
     !line.startsWith('---') && !line.startsWith('+++')
-  ).join('\n');
+  );
+  return [...header, ...lines.slice(headerEnd)].join('\n');
+}
+
+// Unified-diff hunks (no ---/+++ file headers), computed in-process so the
+// output is identical on every platform.
+export function unifiedDiff(oldText: string, newText: string): string {
+  const patch = structuredPatch('old', 'new', oldText, newText, undefined, undefined, { context: 3 });
+  const out: string[] = [];
+  for (const hunk of patch.hunks) {
+    out.push(`@@ -${hunk.oldStart},${hunk.oldLines} +${hunk.newStart},${hunk.newLines} @@`);
+    out.push(...hunk.lines);
+  }
+  return out.length ? out.join('\n') + '\n' : '';
 }
 
 export function prependMergeMarker(content: string, diff: string): string {
   if (hasMergeMarker(content)) return content;
   return `${MERGE_START}\n${cleanDiff(diff).trimEnd()}\n${MERGE_END}\n${content}`;
+}
+
+// Adds a marker block for a NEW upstream change even when an unresolved block
+// from an earlier change is still present — each distinct upstream delta is
+// preserved as its own stacked block. Re-offering the same diff is a no-op so
+// repeated pulls never pile up duplicates.
+export function addMergeMarker(content: string, diff: string): { content: string; added: boolean } {
+  const block = `${MERGE_START}\n${cleanDiff(diff).trimEnd()}\n${MERGE_END}\n`;
+  if (content.includes(block)) return { content, added: false };
+  return { content: block + content, added: true };
 }
 
 // ============================================================================
