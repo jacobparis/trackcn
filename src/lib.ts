@@ -122,22 +122,64 @@ export function addMergeMarker(content: string, diff: string): { content: string
 // Source Parsing & Canonical URLs
 // ============================================================================
 
-export interface ParsedGist { type: 'gist'; gist: string }
-export interface ParsedRepo { type: 'repo'; owner: string; repo: string; path: string; ref: string; startLine?: number; endLine?: number }
-export interface ParsedRepoShorthand { type: 'repo-shorthand'; owner: string; repo: string; path: string; ref?: string }
+export interface MarkdownSectionRef { level: number; heading: string; raw: string }
+export interface ParsedGist { type: 'gist'; gist: string; filename?: string; markdownSection?: MarkdownSectionRef }
+export interface ParsedRepo { type: 'repo'; owner: string; repo: string; path: string; ref: string; startLine?: number; endLine?: number; markdownSection?: MarkdownSectionRef }
+export interface ParsedRepoShorthand { type: 'repo-shorthand'; owner: string; repo: string; path: string; ref?: string; markdownSection?: MarkdownSectionRef }
 export interface ParsedRaw { type: 'raw'; url: string; filename: string }
 export interface ParsedCommit { type: 'commit'; owner: string; repo: string; sha: string }
 export interface ParsedCommitRange { type: 'commit-range'; owner: string; repo: string; base: string; head: string }
 export interface ParsedPull { type: 'pull'; owner: string; repo: string; number: number }
 export type ParsedSource = ParsedGist | ParsedRepo | ParsedRepoShorthand | ParsedRaw | ParsedCommit | ParsedCommitRange | ParsedPull;
 
-export function parseUrl(input: string): ParsedSource {
-  if (input.includes('gist.github.com')) {
-    const match = input.match(/gist\.github\.com\/(?:[^/]+\/)?([a-f0-9]+)/i);
-    if (match) return { type: 'gist', gist: match[1] };
+export function isMarkdownPath(path: string): boolean {
+  return /\.(md|mdx)$/i.test(path);
+}
+
+export function normalizeMarkdownHeading(value: string): string {
+  return value
+    .trim()
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/[^\p{L}\p{N}]+/gu, '-')
+    .replace(/^-+|-+$/g, '')
+    .toLowerCase();
+}
+
+export function parseMarkdownSectionFragment(fragment: string): MarkdownSectionRef | null {
+  const match = fragment.match(/^(#{1,6})([^#].*)$/);
+  if (!match) return null;
+  const heading = normalizeMarkdownHeading(decodeURIComponent(match[2]));
+  if (!heading) return null;
+  return { level: match[1].length, heading, raw: `${match[1]}${heading}` };
+}
+
+function parseGistFragment(fragment: string): Pick<ParsedGist, 'filename' | 'markdownSection'> {
+  const filenameMatch = fragment.match(/^#(.+?\.(?:md|mdx))(#{1,6}[^#].*)$/i);
+  if (filenameMatch) {
+    const filename = decodeURIComponent(filenameMatch[1]);
+    const section = parseMarkdownSectionFragment(filenameMatch[2]);
+    return section ? { filename, markdownSection: section } : {};
   }
-  if (/^[a-f0-9]{20,}$/i.test(input)) {
-    return { type: 'gist', gist: input };
+
+  const markdownSection = parseMarkdownSectionFragment(fragment);
+  return markdownSection ? { markdownSection } : {};
+}
+
+export function parseUrl(input: string): ParsedSource {
+  let inputFragment = '';
+  let inputWithoutFragment = input;
+  const inputFragmentIdx = input.indexOf('#');
+  if (inputFragmentIdx !== -1) {
+    inputFragment = input.slice(inputFragmentIdx);
+    inputWithoutFragment = input.slice(0, inputFragmentIdx);
+  }
+
+  if (inputWithoutFragment.includes('gist.github.com')) {
+    const match = inputWithoutFragment.match(/gist\.github\.com\/(?:[^/]+\/)?([a-f0-9]+)/i);
+    if (match) return { type: 'gist', gist: match[1], ...parseGistFragment(inputFragment) };
+  }
+  if (/^[a-f0-9]{20,}$/i.test(inputWithoutFragment)) {
+    return { type: 'gist', gist: inputWithoutFragment, ...parseGistFragment(inputFragment) };
   }
 
   // Expand owner/repo/<github-route>/... shorthand before matching full URLs.
@@ -187,9 +229,12 @@ export function parseUrl(input: string): ParsedSource {
   if (repoMatch) {
     const parsed: ParsedRepo = { type: 'repo', owner: repoMatch[1], repo: repoMatch[2], ref: repoMatch[3], path: repoMatch[4] || '' };
     const lineMatch = fragment.match(/^#L(\d+)(?:-L(\d+))?$/);
+    const markdownSection = isMarkdownPath(parsed.path) ? parseMarkdownSectionFragment(fragment) : null;
     if (lineMatch) {
       parsed.startLine = parseInt(lineMatch[1], 10);
       parsed.endLine = lineMatch[2] ? parseInt(lineMatch[2], 10) : parsed.startLine;
+    } else if (markdownSection) {
+      parsed.markdownSection = markdownSection;
     } else if (fragment) {
       // GitHub route URLs cannot unambiguously split a branch containing `/`
       // from the repository path. An explicit fragment selects that ref.
@@ -224,7 +269,9 @@ export function parseUrl(input: string): ParsedSource {
       owner: shortMatch[1],
       repo: shortMatch[2],
       path: shortMatch[3] || '',
-      ...(fragment && !fragment.match(/^#L\d/) ? { ref: fragment.slice(1) } : {}),
+      ...(isMarkdownPath(shortMatch[3] || '') && parseMarkdownSectionFragment(fragment)
+        ? { markdownSection: parseMarkdownSectionFragment(fragment)! }
+        : fragment && !fragment.match(/^#L\d/) ? { ref: fragment.slice(1) } : {}),
     };
   }
 
@@ -232,19 +279,26 @@ export function parseUrl(input: string): ParsedSource {
 }
 
 export function canonicalUrl(parsed: ParsedSource): string {
-  if (parsed.type === 'gist') return `https://gist.github.com/${parsed.gist}`;
+  if (parsed.type === 'gist') {
+    const fragment = parsed.markdownSection
+      ? `${parsed.filename ? `#${encodeURIComponent(parsed.filename)}` : ''}${parsed.markdownSection.raw}`
+      : '';
+    return `https://gist.github.com/${parsed.gist}${fragment}`;
+  }
   if (parsed.type === 'raw') return parsed.url;
   if (parsed.type === 'commit') return `https://github.com/${parsed.owner}/${parsed.repo}/commit/${parsed.sha}`;
   if (parsed.type === 'commit-range') return `https://github.com/${parsed.owner}/${parsed.repo}/compare/${parsed.base}...${parsed.head}`;
   if (parsed.type === 'pull') return `https://github.com/${parsed.owner}/${parsed.repo}/pull/${parsed.number}`;
   if (parsed.type === 'repo-shorthand') {
-    return `${parsed.owner}/${parsed.repo}${parsed.path ? `/${parsed.path}` : ''}${parsed.ref ? `#${parsed.ref}` : ''}`;
+    const fragment = parsed.markdownSection ? parsed.markdownSection.raw : parsed.ref ? `#${parsed.ref}` : '';
+    return `${parsed.owner}/${parsed.repo}${parsed.path ? `/${parsed.path}` : ''}${fragment}`;
   }
   const pathPart = parsed.path ? `/${parsed.path}` : '';
   const linePart = parsed.startLine
     ? (parsed.endLine && parsed.endLine !== parsed.startLine ? `#L${parsed.startLine}-L${parsed.endLine}` : `#L${parsed.startLine}`)
     : '';
-  return `https://github.com/${parsed.owner}/${parsed.repo}/tree/${parsed.ref}${pathPart}${linePart}`;
+  const sectionPart = parsed.markdownSection ? parsed.markdownSection.raw : '';
+  return `https://github.com/${parsed.owner}/${parsed.repo}/tree/${parsed.ref}${pathPart}${linePart || sectionPart}`;
 }
 
 export function isLocalPath(a: string): boolean {

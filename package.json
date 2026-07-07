@@ -1,6 +1,6 @@
 {
   "name": "trackcn",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Track GitHub files, directories, commits, pull requests, and agent skills like dependencies.",
   "type": "module",
   "main": "./dist/index.js",

@@ -9,10 +9,10 @@ import { randomUUID } from 'crypto';
 import { execFileSync, execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import {
-  type FileType, type FileContent, type SourceFile, type ParsedSource, type ParsedRepo,
+  type FileType, type FileContent, type SourceFile, type ParsedSource, type ParsedRepo, type ParsedGist, type MarkdownSectionRef,
   categorizeFile, getPatchOrder, contentHash, decodeFetchedContent, asText, decodeGistFilename, sortFiles,
   MERGE_START, MERGE_END, hasMergeMarker, cleanDiff, prependMergeMarker, addMergeMarker, unifiedDiff,
-  parseUrl, canonicalUrl, isLocalPath, lastPathSegment,
+  parseUrl, canonicalUrl, isLocalPath, lastPathSegment, parseMarkdownSectionFragment, isMarkdownPath, normalizeMarkdownHeading,
 } from './lib.js';
 
 // ============================================================================
@@ -680,8 +680,23 @@ interface RepocnSource {
 
 interface RepocnManifest { sources: RepocnSource[] }
 
+interface LocalTargetRef {
+  path: string;
+  section?: MarkdownSectionRef;
+}
+
+function splitLocalTarget(target: string): LocalTargetRef {
+  const fragmentIdx = target.indexOf('#');
+  if (fragmentIdx === -1) return { path: target };
+  const path = target.slice(0, fragmentIdx);
+  const fragment = target.slice(fragmentIdx);
+  const section = isMarkdownPath(path) ? parseMarkdownSectionFragment(fragment) : null;
+  return section ? { path, section } : { path: target };
+}
+
 function targetPath(rootDir: string, target: string): string {
-  return isAbsolute(target) ? target : join(rootDir, target);
+  const local = splitLocalTarget(target);
+  return isAbsolute(local.path) ? local.path : join(rootDir, local.path);
 }
 
 function normalizeSourceTarget(target: string): string {
@@ -695,6 +710,138 @@ function normalizeSourceTarget(target: string): string {
 function withDestination(prefix: string, target: string): string {
   const relativeTarget = normalizeSourceTarget(target);
   return prefix ? join(prefix, relativeTarget) : relativeTarget;
+}
+
+function markdownHeadingMatch(line: string): { level: number; heading: string } | null {
+  const match = line.match(/^( {0,3})(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$/);
+  if (!match) return null;
+  return { level: match[2].length, heading: normalizeMarkdownHeading(match[3]) };
+}
+
+function findMarkdownSection(lines: string[], section: MarkdownSectionRef): { heading: number; bodyStart: number; end: number } | null {
+  for (let i = 0; i < lines.length; i++) {
+    const heading = markdownHeadingMatch(lines[i]);
+    if (!heading || heading.level !== section.level || heading.heading !== section.heading) continue;
+
+    let end = lines.length;
+    for (let j = i + 1; j < lines.length; j++) {
+      const next = markdownHeadingMatch(lines[j]);
+      if (next && next.level <= section.level) {
+        end = j;
+        break;
+      }
+    }
+    return { heading: i, bodyStart: i + 1, end };
+  }
+  return null;
+}
+
+function ensureTrailingNewline(text: string): string {
+  return text.endsWith('\n') ? text : `${text}\n`;
+}
+
+function splitMarkdownLines(text: string): string[] {
+  const normalized = text.replace(/\r\n/g, '\n');
+  const trimmed = normalized.endsWith('\n') ? normalized.slice(0, -1) : normalized;
+  return trimmed ? trimmed.split('\n') : [];
+}
+
+function extractMarkdownSectionBody(text: string, section: MarkdownSectionRef): string {
+  const lines = splitMarkdownLines(text);
+  const found = findMarkdownSection(lines, section);
+  if (!found) throw new Error(`Markdown heading not found: ${'#'.repeat(section.level)} ${section.heading}`);
+  return ensureTrailingNewline(lines.slice(found.bodyStart, found.end).join('\n'));
+}
+
+function replaceMarkdownSectionBody(document: string, section: MarkdownSectionRef, body: string): string {
+  const lines = splitMarkdownLines(document);
+  const found = findMarkdownSection(lines, section);
+  const bodyLines = splitMarkdownLines(ensureTrailingNewline(body));
+
+  if (!found) {
+    const prefix = lines.length > 0 ? [...lines, ''] : [];
+    return ensureTrailingNewline([...prefix, `${'#'.repeat(section.level)} ${section.heading}`, ...bodyLines].join('\n'));
+  }
+
+  return ensureTrailingNewline([
+    ...lines.slice(0, found.bodyStart),
+    ...bodyLines,
+    ...lines.slice(found.end),
+  ].join('\n'));
+}
+
+async function readTrackedContent(rootDir: string, target: string): Promise<FileContent | null> {
+  const fullPath = targetPath(rootDir, target);
+  if (!existsSync(fullPath)) return null;
+  const content = await readFile(fullPath);
+  const section = splitLocalTarget(target).section;
+  if (!section) return content;
+  const text = asText(content);
+  if (text === null) return null;
+  try {
+    return extractMarkdownSectionBody(text, section);
+  } catch {
+    return null;
+  }
+}
+
+async function writeTrackedContent(rootDir: string, target: string, content: FileContent): Promise<void> {
+  const fullPath = targetPath(rootDir, target);
+  const section = splitLocalTarget(target).section;
+  await mkdir(dirname(fullPath), { recursive: true });
+  if (!section) {
+    await writeFile(fullPath, content);
+    return;
+  }
+  const text = asText(content);
+  if (text === null) throw new Error(`Markdown heading targets require text content: ${target}`);
+  const current = existsSync(fullPath) ? await readFile(fullPath, 'utf-8') : '';
+  await writeFile(fullPath, replaceMarkdownSectionBody(current, section, text));
+}
+
+async function deleteTrackedContent(rootDir: string, target: string): Promise<void> {
+  const fullPath = targetPath(rootDir, target);
+  const section = splitLocalTarget(target).section;
+  if (!section) {
+    await unlink(fullPath);
+    return;
+  }
+  if (!existsSync(fullPath)) return;
+  const current = await readFile(fullPath, 'utf-8');
+  await writeFile(fullPath, replaceMarkdownSectionBody(current, section, ''));
+}
+
+function applyRepoContentRange(content: FileContent, parsed: ParsedRepo): FileContent {
+  if (parsed.startLine) {
+    if (typeof content !== 'string') throw new Error('Line ranges (#L...) cannot be used with binary files.');
+    const lines = content.split('\n');
+    return lines.slice(parsed.startLine - 1, parsed.endLine || parsed.startLine).join('\n') + '\n';
+  }
+  if (parsed.markdownSection) {
+    const text = asText(content);
+    if (text === null) throw new Error('Markdown heading ranges (#Heading) cannot be used with binary files.');
+    return extractMarkdownSectionBody(text, parsed.markdownSection);
+  }
+  return content;
+}
+
+function applyGistContentRange(files: SourceFile[], parsed: ParsedGist): SourceFile[] {
+  if (!parsed.markdownSection) return files;
+
+  const candidates = parsed.filename
+    ? files.filter((file) => file.filename === parsed.filename || file.target === parsed.filename)
+    : files.filter((file) => file.type === 'regular');
+
+  if (candidates.length !== 1) {
+    throw new Error(parsed.filename
+      ? `Gist markdown file not found or ambiguous: ${parsed.filename}`
+      : 'Gist markdown heading ranges without a filename require a single regular file.');
+  }
+
+  const file = candidates[0];
+  const text = asText(file.content);
+  if (text === null) throw new Error('Markdown heading ranges (#Heading) cannot be used with binary files.');
+  return [{ ...file, content: extractMarkdownSectionBody(text, parsed.markdownSection) }];
 }
 
 async function readManifest(rootDir: string): Promise<RepocnManifest | null> {
@@ -845,7 +992,7 @@ async function trace(event: string, data?: Record<string, unknown>): Promise<voi
 // CLI: arg parsing
 // ============================================================================
 
-const VERSION = '0.7.0';
+const VERSION = '0.8.0';
 
 function showHelp() {
   console.log(`
@@ -999,6 +1146,13 @@ function sourceLabel(url: string, version?: string): string {
     // Fall through to the original value if parsing fails.
   }
   return url;
+}
+
+function sourceStatusLabel(source: RepocnSource): string {
+  const targets = trackedFilePaths(source);
+  if (targets.length === 0) return sourceLabel(source.url, source.version);
+  if (targets.length <= 3) return `${sourceLabel(source.url, source.version)} -> ${targets.join(', ')}`;
+  return `${sourceLabel(source.url, source.version)} -> ${targets.slice(0, 3).join(', ')} +${targets.length - 3} more`;
 }
 
 // ============================================================================
@@ -1327,7 +1481,7 @@ async function cmdAdd(positional: string[]) {
           || registrySourceUrl(registryOwner, registryRepo, registryItem);
       } else if (parsed.type === 'gist') {
         const gist = await fetchGist(parsed.gist);
-        files = gistToFiles(gist);
+        files = applyGistContentRange(gistToFiles(gist), parsed);
         version = gist.history?.[0]?.version || '';
         description = gist.description || 'Unnamed gist';
       } else if (parsed.type === 'raw') {
@@ -1376,17 +1530,11 @@ async function cmdAdd(positional: string[]) {
           fetchRepoFiles(parsed.owner, parsed.repo, parsed.path, parsed.ref),
           fetchRepoCommitSha(parsed.owner, parsed.repo, parsed.ref),
         ]);
-        // Line-range extraction
-        if (parsed.startLine && rawFiles.length === 1) {
-          if (typeof rawFiles[0].content !== 'string') {
-            throw new Error('Line ranges (#L...) cannot be used with binary files.');
-          }
-          const lines = rawFiles[0].content.split('\n');
-          const start = parsed.startLine - 1; // 0-indexed
-          const end = parsed.endLine || parsed.startLine;
-          rawFiles[0].content = lines.slice(start, end).join('\n') + '\n';
-        } else if (parsed.startLine && rawFiles.length > 1) {
-          throw new Error('Line range (#L...) can only be used with single file URLs, not directories.');
+        // Content-range extraction
+        if ((parsed.startLine || parsed.markdownSection) && rawFiles.length === 1) {
+          rawFiles[0].content = applyRepoContentRange(rawFiles[0].content, parsed);
+        } else if ((parsed.startLine || parsed.markdownSection) && rawFiles.length > 1) {
+          throw new Error('Content ranges (#L... or #Heading) can only be used with single file URLs, not directories.');
         }
         files = repoFilesToSourceFiles(rawFiles, parsed.path);
         repoSingleFile = rawFiles.length === 1 && rawFiles[0].path === parsed.path;
@@ -1419,7 +1567,8 @@ async function cmdAdd(positional: string[]) {
         && (repoSingleFile === null || repoSingleFile);
       // Target semantics: trailing / is always a directory, a basename with an
       // extension is a file path, anything else is a directory.
-      const looksLikeFilePath = !deriveNames && extname(basename(directory)) !== '';
+      const directoryTarget = splitLocalTarget(directory);
+      const looksLikeFilePath = !deriveNames && extname(basename(directoryTarget.path)) !== '';
       if (looksLikeFilePath && isSingleFile) {
         fileTarget = directory.startsWith('./') ? directory.slice(2) : directory;
       } else if (looksLikeFilePath) {
@@ -1432,8 +1581,9 @@ async function cmdAdd(positional: string[]) {
       // Changesets always derive when trailing / is used
       const shouldDerive = deriveNames && (parsed.type === 'raw' || isChangeset || !isSingleFile);
       if (fileTarget) {
-        prefix = dirname(fileTarget);
-        files[0].target = basename(fileTarget);
+        const target = splitLocalTarget(fileTarget);
+        prefix = dirname(target.path);
+        files[0].target = `${basename(target.path)}${target.section ? target.section.raw : ''}`;
       } else if (shouldDerive) {
         // Directory source + trailing /: derive subdirectory from URL's last path segment
         prefix = join(directory, lastPathSegment(parsed));
@@ -1715,8 +1865,8 @@ async function cmdAdd(positional: string[]) {
       const fullPath = targetPath(rootDir, file.target);
       const newHash = contentHash(file.content);
 
-      if (existsSync(fullPath)) {
-        const diskContent = await readFile(fullPath);
+      const diskContent = await readTrackedContent(rootDir, file.target);
+      if (diskContent !== null) {
         const diskHash = contentHash(diskContent);
 
         // File already has the right content — just update tracking
@@ -1733,7 +1883,7 @@ async function cmdAdd(positional: string[]) {
           // Tracked by this source — is it modified?
           if (diskHash === storedHash || force) {
             // Unmodified or --force: safe to overwrite
-            await writeFile(fullPath, file.content);
+            await writeTrackedContent(rootDir, file.target, file.content);
             sourceEntry.files[file.target] = newHash;
             await trace('add:file:overwrite', { path: file.target, force });
             written.push(file.target);
@@ -1757,17 +1907,22 @@ async function cmdAdd(positional: string[]) {
             // User modified — merge marker (base is the local file: at add
             // time there is no recorded old upstream version to diff from)
             const diff = DISK_BASE_NOTE + unifiedDiff(diskText, newText);
-            await writeFile(fullPath, prependMergeMarker(diskText, diff));
+            await writeTrackedContent(rootDir, file.target, prependMergeMarker(diskText, diff));
             sourceEntry.files[file.target] = newHash;
             await trace('add:file:merge', { path: file.target });
             merged.push(file.target);
           }
         } else if (force) {
           // Not tracked by this source, but --force: overwrite
-          await mkdir(dirname(fullPath), { recursive: true });
-          await writeFile(fullPath, file.content);
+          await writeTrackedContent(rootDir, file.target, file.content);
           sourceEntry.files[file.target] = newHash;
           await trace('add:file:force', { path: file.target });
+          written.push(file.target);
+        } else if (splitLocalTarget(file.target).section) {
+          // Explicit markdown section targets opt into managing that section.
+          await writeTrackedContent(rootDir, file.target, file.content);
+          sourceEntry.files[file.target] = newHash;
+          await trace('add:file:section', { path: file.target });
           written.push(file.target);
         } else {
           // File exists, not tracked by this source: skip to avoid data loss
@@ -1776,8 +1931,7 @@ async function cmdAdd(positional: string[]) {
         }
       } else {
         // New file — write it
-        await mkdir(dirname(fullPath), { recursive: true });
-        await writeFile(fullPath, file.content);
+        await writeTrackedContent(rootDir, file.target, file.content);
         sourceEntry.files[file.target] = newHash;
         await trace('add:file:write', { path: file.target });
         written.push(file.target);
@@ -1866,9 +2020,8 @@ async function syncRefetchedFiles({
 }): Promise<{ anyChanges: boolean; deferred: boolean }> {
   let anyChanges = false;
   let deferred = false;
-  const write = dryRun ? async (_path: string, _content: FileContent) => {} : writeFile;
-  const remove = dryRun ? async (_path: string) => {} : unlink;
-  const ensureDir = dryRun ? async (_path: string) => {} : (path: string) => mkdir(path, { recursive: true });
+  const writeTarget = dryRun ? async (_target: string, _content: FileContent) => {} : (target: string, content: FileContent) => writeTrackedContent(rootDir, target, content);
+  const removeTarget = dryRun ? async (_target: string) => {} : (target: string) => deleteTrackedContent(rootDir, target);
   const upstream = new Map(filterIgnoredSourceFiles(sourceEntry, files.filter((file) => file.type === 'regular')).map((file) => [file.target, file]));
 
   for (const trackedPath of Object.keys(sourceEntry.files)) {
@@ -1883,9 +2036,12 @@ async function syncRefetchedFiles({
     const fullPath = targetPath(rootDir, trackedPath);
     let removeTracking = !existsSync(fullPath);
     if (existsSync(fullPath)) {
-      const diskHash = contentHash(await readFile(fullPath));
-      if (diskHash === storedHash || force) {
-        await remove(fullPath);
+      const diskContent = await readTrackedContent(rootDir, trackedPath);
+      const diskHash = diskContent === null ? null : contentHash(diskContent);
+      if (diskContent === null) {
+        removeTracking = true;
+      } else if (diskHash === storedHash || force) {
+        await removeTarget(trackedPath);
         results.deleted.push(trackedPath);
         anyChanges = true;
         removeTracking = true;
@@ -1902,15 +2058,21 @@ async function syncRefetchedFiles({
     const storedHash = sourceEntry.files[file.target];
 
     if (!existsSync(fullPath)) {
-      await ensureDir(dirname(fullPath));
-      await write(fullPath, file.content);
+      await writeTarget(file.target, file.content);
       sourceEntry.files[file.target] = newHash;
       results.added.push(file.target);
       anyChanges = true;
       continue;
     }
 
-    const diskContent = await readFile(fullPath);
+    const diskContent = await readTrackedContent(rootDir, file.target);
+    if (diskContent === null) {
+      await writeTarget(file.target, file.content);
+      sourceEntry.files[file.target] = newHash;
+      results.added.push(file.target);
+      anyChanges = true;
+      continue;
+    }
     const diskHash = contentHash(diskContent);
     if (diskHash === newHash) {
       sourceEntry.files[file.target] = newHash;
@@ -1927,7 +2089,7 @@ async function syncRefetchedFiles({
     const upstreamChanged = storedHash !== newHash;
 
     if (!userModified || force) {
-      await write(fullPath, file.content);
+      await writeTarget(file.target, file.content);
       sourceEntry.files[file.target] = newHash;
       results.updated.push(file.target);
       anyChanges = true;
@@ -1955,7 +2117,7 @@ async function syncRefetchedFiles({
         : unifiedDiff(oldText, newText);
       const marked = addMergeMarker(diskText, diff);
       if (marked.added) {
-        await write(fullPath, marked.content);
+        await writeTarget(file.target, marked.content);
         results.merged.push(file.target);
         anyChanges = true;
       }
@@ -2203,9 +2365,8 @@ async function cmdPull() {
             if (!(error as Error).message.startsWith('Not found:')) throw error;
             if (!json) console.log(`    (path not found upstream — removed or renamed)`);
           }
-          if (parsed.startLine && rawFiles.length === 1 && typeof rawFiles[0].content === 'string') {
-            const lines = rawFiles[0].content.split('\n');
-            rawFiles[0].content = lines.slice(parsed.startLine - 1, parsed.endLine || parsed.startLine).join('\n') + '\n';
+          if ((parsed.startLine || parsed.markdownSection) && rawFiles.length === 1) {
+            rawFiles[0].content = applyRepoContentRange(rawFiles[0].content, parsed);
           }
           const files = repoFilesToSourceFiles(rawFiles, parsed.path);
           const isSingleFile = rawFiles.length === 1 && rawFiles[0].path === parsed.path && trackedKeys.length === 1;
@@ -2231,9 +2392,8 @@ async function cmdPull() {
               const old = await fetchRepoFiles(parsed.owner, parsed.repo, upstreamPath, oldVersion, false);
               if (old.length !== 1) return null;
               let text = asText(old[0].content);
-              if (text !== null && parsed.startLine) {
-                const lines = text.split('\n');
-                text = lines.slice(parsed.startLine - 1, parsed.endLine || parsed.startLine).join('\n') + '\n';
+              if (text !== null && (parsed.startLine || parsed.markdownSection)) {
+                text = asText(applyRepoContentRange(text, parsed));
               }
               return text;
             } catch {
@@ -2247,10 +2407,10 @@ async function cmdPull() {
           if (anyChanges && sourceEntry['post-pull']) hooksToRun.push(sourceEntry['post-pull']);
         };
 
-        // Line ranges always refetch (slicing can't be derived from diffs), and
+        // Content ranges always refetch (slicing can't be derived from diffs), and
         // single-tracked-file sources refetch because compare filtering is
         // directory-oriented — refetching one file is a single request anyway.
-        if (parsed.startLine || trackedKeys.length === 1) {
+        if (parsed.startLine || parsed.markdownSection || trackedKeys.length === 1) {
           await fullRefetchSync();
           continue;
         }
@@ -2720,8 +2880,47 @@ async function cmdPull() {
 
         if (latestVersion === sourceEntry.version) continue;
 
+        const trackedKeys = Object.keys(sourceEntry.files);
+        const hasSectionTarget = trackedKeys.some((target) => !!splitLocalTarget(target).section);
+
+        if (parsed.markdownSection || hasSectionTarget) {
+          const files = applyGistContentRange(gistToFiles(gist), parsed);
+          const trackedKeys = Object.keys(sourceEntry.files);
+          if (files.length === 1 && trackedKeys.length === 1) {
+            files[0].target = trackedKeys[0];
+          } else {
+            for (const file of files) file.target = withDestination(sourceEntry.prefix || '', file.target);
+          }
+
+          const getOldText = async (target: string): Promise<string | null> => {
+            try {
+              const oldGist = await fetchGist(parsed.gist, sourceEntry.version);
+              const oldFiles = applyGistContentRange(gistToFiles(oldGist), parsed);
+              if (oldFiles.length === 1 && trackedKeys.length === 1) {
+                oldFiles[0].target = trackedKeys[0];
+              } else {
+                for (const file of oldFiles) file.target = withDestination(sourceEntry.prefix || '', file.target);
+              }
+              const oldFile = oldFiles.find((file) => file.target === target);
+              return oldFile ? asText(oldFile.content) : null;
+            } catch {
+              return null;
+            }
+          };
+
+          const sync = await syncRefetchedFiles({ rootDir, sourceEntry, files, force, dryRun, results, getOldText });
+          anyChanges = sync.anyChanges;
+          if (!sync.deferred) sourceEntry.version = latestVersion;
+          if (anyChanges && sourceEntry['post-pull']) hooksToRun.push(sourceEntry['post-pull']);
+          continue;
+        }
+
         const files = gistToFiles(gist);
-        for (const file of files) file.target = withDestination(sourceEntry.prefix || '', file.target);
+        if (files.length === 1 && trackedKeys.length === 1) {
+          files[0].target = trackedKeys[0];
+        } else {
+          for (const file of files) file.target = withDestination(sourceEntry.prefix || '', file.target);
+        }
         const regular = filterIgnoredSourceFiles(sourceEntry, files.filter((f) => f.type === 'regular'));
 
         let oldFiles: SourceFile[] = [];
@@ -2729,7 +2928,11 @@ async function cmdPull() {
           try {
             const oldGist = await fetchGist(parsed.gist, sourceEntry.version);
             oldFiles = gistToFiles(oldGist).filter((f) => f.type === 'regular');
-            for (const file of oldFiles) file.target = withDestination(sourceEntry.prefix || '', file.target);
+            if (oldFiles.length === 1 && trackedKeys.length === 1) {
+              oldFiles[0].target = trackedKeys[0];
+            } else {
+              for (const file of oldFiles) file.target = withDestination(sourceEntry.prefix || '', file.target);
+            }
           } catch { /* can't get old version */ }
         }
 
@@ -2934,8 +3137,11 @@ async function latestSourceFilesForStatus(rootDir: string, sourceEntry: RepocnSo
   const parsed = parseUrl(sourceEntry.url);
   if (parsed.type === 'gist') {
     const gist = await fetchGist(parsed.gist);
-    const files = gistToFiles(gist).filter((file) => file.type === 'regular');
-    if (sourceEntry.prefix) {
+    const files = applyGistContentRange(gistToFiles(gist), parsed).filter((file) => file.type === 'regular');
+    const trackedKeys = Object.keys(sourceEntry.files);
+    if (files.length === 1 && trackedKeys.length === 1) {
+      files[0].target = trackedKeys[0];
+    } else if (sourceEntry.prefix) {
       for (const file of files) file.target = join(sourceEntry.prefix, file.target);
     }
     return files;
@@ -2954,9 +3160,8 @@ async function latestSourceFilesForStatus(rootDir: string, sourceEntry: RepocnSo
   if (parsed.type === 'repo') {
     // Fetch at the resolved head (baseline SHA refs check the default branch)
     const rawFiles = await fetchRepoFiles(parsed.owner, parsed.repo, parsed.path, latestVersion || parsed.ref);
-    if (parsed.startLine && rawFiles.length === 1 && typeof rawFiles[0].content === 'string') {
-      const lines = rawFiles[0].content.split('\n');
-      rawFiles[0].content = lines.slice(parsed.startLine - 1, parsed.endLine || parsed.startLine).join('\n') + '\n';
+    if ((parsed.startLine || parsed.markdownSection) && rawFiles.length === 1) {
+      rawFiles[0].content = applyRepoContentRange(rawFiles[0].content, parsed);
     }
     const files = repoFilesToSourceFiles(rawFiles, parsed.path).filter((file) => file.type === 'regular');
     const trackedKeys = Object.keys(sourceEntry.files);
@@ -2995,7 +3200,8 @@ async function statusActionsForChangedSource(rootDir: string, sourceEntry: Repoc
       continue;
     }
 
-    const diskHash = contentHash(await readFile(fullPath));
+    const diskContent = await readTrackedContent(rootDir, target);
+    const diskHash = diskContent === null ? null : contentHash(diskContent);
     actions.push(diskHash === storedHash
       ? { code: 'M', path: target }
       : { code: 'C', path: target, note: 'modified locally' });
@@ -3081,7 +3287,7 @@ async function cmdStatus() {
       } catch (error) {
         failed = true;
         if (!json) {
-          console.log(`  ${sourceLabel(sourceEntry.url, sourceEntry.version)}`);
+          console.log(`  ${sourceStatusLabel(sourceEntry)}`);
           console.log(`    ERROR: ${(error as Error).message}`);
         }
         jsonSources.push({ url: sourceEntry.url, error: (error as Error).message });
@@ -3097,7 +3303,8 @@ async function cmdStatus() {
       for (const [filePath, storedHash] of trackedFileEntries(sourceEntry)) {
         const fullPath = targetPath(rootDir, filePath);
         if (!existsSync(fullPath)) { missing.push(filePath); continue; }
-        const diskContent = await readFile(fullPath);
+        const diskContent = await readTrackedContent(rootDir, filePath);
+        if (diskContent === null) { missing.push(filePath); continue; }
         const diskText = asText(diskContent);
         if (diskText !== null && hasMergeMarker(diskText)) unresolvedMerges.push(filePath);
         const diskHash = contentHash(diskContent);
@@ -3130,8 +3337,8 @@ async function cmdStatus() {
           unresolvedMerges,
           upstreamActions: upstreamActions || [],
         });
-      } else if (hasHumanAction) {
-        console.log(`  ${sourceLabel(sourceEntry.url, sourceEntry.version)}`);
+      } else {
+        console.log(`  ${sourceStatusLabel(sourceEntry)}`);
         if (versionChanged && sourceStale) {
           console.log(`    Upstream changed (${sourceEntry.version.slice(0, 8)} -> ${latestVersion.slice(0, 8)})`);
           for (const action of upstreamActions || []) {
@@ -3139,17 +3346,17 @@ async function cmdStatus() {
           }
         }
         for (const p of unresolvedMerges) console.log(`    ${statusCode('C')} ${p} (unresolved merge)`);
+        if (!hasHumanAction) console.log('    No upstream changes.');
       }
     }
 
     if (json) {
       console.log(JSON.stringify({ sources: jsonSources, stale, drifted, failed }, null, 2));
     } else {
-      if (!stale && !failed && !conflicted) console.log('  No upstream changes.\n');
-      else {
+      if (stale || failed || conflicted) {
         console.log('');
         if (stale) console.log('  Run `trackcn pull` to update.\n');
-      }
+      } else console.log('');
     }
 
     await trace('status:done', { stale, drifted, sources: jsonSources.map((s: Record<string, unknown>) => ({ url: s.url, versionChanged: s.versionChanged, locallyModified: s.locallyModified, unresolvedMerges: s.unresolvedMerges })) });
@@ -3187,7 +3394,7 @@ async function cmdRemove(positional: string[]) {
     if (hard) {
       for (const filePath of removed) {
         const fullPath = targetPath(rootDir, filePath);
-        if (existsSync(fullPath)) await unlink(fullPath);
+        if (existsSync(fullPath)) await deleteTrackedContent(rootDir, filePath);
       }
     }
     await writeManifest(rootDir, manifest);

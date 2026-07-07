@@ -28,6 +28,25 @@ describe('parseUrl', () => {
       expect(result).toEqual({ type: 'gist', gist: id });
     });
 
+    it('parses a single-file gist markdown heading fragment', () => {
+      const result = parseUrl('https://gist.github.com/user/abc123def456789012345##Installation');
+      expect(result).toEqual({
+        type: 'gist',
+        gist: 'abc123def456789012345',
+        markdownSection: { level: 2, heading: 'installation', raw: '##installation' },
+      });
+    });
+
+    it('parses a filename-qualified gist markdown heading fragment', () => {
+      const result = parseUrl('https://gist.github.com/user/abc123def456789012345#AGENTS.md##Installation');
+      expect(result).toEqual({
+        type: 'gist',
+        gist: 'abc123def456789012345',
+        filename: 'AGENTS.md',
+        markdownSection: { level: 2, heading: 'installation', raw: '##installation' },
+      });
+    });
+
     it('does not treat short hex strings as gists', () => {
       expect(() => parseUrl('abc123')).toThrow();
     });
@@ -175,6 +194,31 @@ describe('parseUrl', () => {
     });
   });
 
+  describe('markdown heading ranges', () => {
+    it('parses an exact markdown heading fragment on GitHub markdown files', () => {
+      const result = parseUrl('https://github.com/owner/repo/blob/main/AGENTS.md##Installation') as ParsedRepo;
+      expect(result.type).toBe('repo');
+      expect(result.path).toBe('AGENTS.md');
+      expect(result.markdownSection).toEqual({ level: 2, heading: 'installation', raw: '##installation' });
+    });
+
+    it('normalizes markdown heading fragments to lowercase kebabs', () => {
+      const result = parseUrl('https://github.com/owner/repo/blob/main/AGENTS.md##Installation%20Steps') as ParsedRepo;
+      expect(result.markdownSection).toEqual({ level: 2, heading: 'installation-steps', raw: '##installation-steps' });
+    });
+
+    it('parses markdown heading fragments on shorthand markdown paths', () => {
+      const result = parseUrl('owner/repo/AGENTS.md###Testing');
+      expect(result).toEqual({
+        type: 'repo-shorthand',
+        owner: 'owner',
+        repo: 'repo',
+        path: 'AGENTS.md',
+        markdownSection: { level: 3, heading: 'testing', raw: '###testing' },
+      });
+    });
+  });
+
   describe('raw URLs', () => {
     it('parses non-GitHub https URL', () => {
       const result = parseUrl('https://example.com/file.txt');
@@ -201,6 +245,11 @@ describe('parseUrl', () => {
 describe('canonicalUrl', () => {
   it('gist', () => {
     expect(canonicalUrl({ type: 'gist', gist: 'abc123' })).toBe('https://gist.github.com/abc123');
+  });
+
+  it('gist with markdown heading range', () => {
+    expect(canonicalUrl({ type: 'gist', gist: 'abc123', filename: 'AGENTS.md', markdownSection: { level: 2, heading: 'install', raw: '##install' } }))
+      .toBe('https://gist.github.com/abc123#AGENTS.md##install');
   });
 
   it('raw', () => {
@@ -236,6 +285,11 @@ describe('canonicalUrl', () => {
   it('repo with single line', () => {
     expect(canonicalUrl({ type: 'repo', owner: 'o', repo: 'r', ref: 'main', path: 'f.ts', startLine: 10, endLine: 10 }))
       .toBe('https://github.com/o/r/tree/main/f.ts#L10');
+  });
+
+  it('repo with markdown heading range', () => {
+    expect(canonicalUrl({ type: 'repo', owner: 'o', repo: 'r', ref: 'main', path: 'AGENTS.md', markdownSection: { level: 2, heading: 'install', raw: '##install' } }))
+      .toBe('https://github.com/o/r/tree/main/AGENTS.md##install');
   });
 
   it('repo shorthand', () => {

@@ -163,6 +163,31 @@ trackcn add owner/repo/blob/main/styles.css#L227-L300 ./styles/prose.css
 
 **Preview:** ranges re-slice on pull but are positional — they can't follow content that moves upstream. Use with caution
 
+### Markdown headings
+
+Track one markdown heading into another markdown heading:
+
+```bash
+trackcn add owner/repo/blob/main/AGENTS.md##Installation ./AGENTS.md##Instructions
+trackcn add owner/repo/blob/main/README.md###Testing ./AGENTS.md##Testing
+trackcn add https://gist.github.com/user/abc123##Installation ./AGENTS.md##Instructions
+trackcn add https://gist.github.com/user/abc123#AGENTS.md##Installation ./AGENTS.md##Instructions
+```
+
+The number of `#` characters selects the exact heading level. Heading text is
+normalized to lowercase kebab-case, so `##Installation Steps`,
+`##installation-steps`, and `## Installation steps` all match the same heading.
+The section copy includes that heading's body and nested content, and stops
+before the next heading at the same or higher level.
+
+When the destination includes a heading fragment, trackcn preserves the local
+heading line and replaces only that section's body. This lets one `AGENTS.md`
+pull different sections from different upstream markdown files while keeping
+local sections outside those headings untouched.
+
+For single-file gists, use the heading directly. For multi-file gists, put the
+gist filename before the heading selector, as in `#AGENTS.md##Installation`.
+
 
 ## How it works
 

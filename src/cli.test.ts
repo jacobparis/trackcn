@@ -432,14 +432,17 @@ describe('CLI status', () => {
   });
 
   it('status exits 0 when up to date', async () => {
-    const { code } = await run('status', dir);
+    const { stdout, code } = await run('status', dir);
     expect(code).toBe(0);
+    expect(stdout).toContain('127.0.0.1/file.txt -> file.txt');
+    expect(stdout).toContain('No upstream changes.');
   });
 
-  it('status stays minimal when only local files are modified', async () => {
+  it('status lists the source but stays quiet about local-only modifications', async () => {
     writeFileSync(join(dir, 'file.txt'), 'modified\n');
     const { stdout, code } = await run('status', dir);
     expect(code).toBe(0);
+    expect(stdout).toContain('127.0.0.1/file.txt -> file.txt');
     expect(stdout).toContain('No upstream changes.');
     expect(stdout).not.toContain('modified locally');
   });
@@ -1300,6 +1303,8 @@ describe('pull: repo sources', () => {
   let headSha = '';
   let dirFiles: Record<string, string> = {};
   let compareFiles: Array<Record<string, unknown>> | null = null;
+  let gistContent = '';
+  let gistVersion = '';
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'trackcn-test-'));
@@ -1307,6 +1312,19 @@ describe('pull: repo sources', () => {
     headSha = 'sha-v1';
     dirFiles = { 'src/a.md': 'aaa v1\n', 'src/b.md': 'bbb v1\n' };
     compareFiles = null;
+    gistContent = [
+      '# Gist',
+      '',
+      '## Installation',
+      '',
+      'gist install v1',
+      '',
+      '## Other',
+      '',
+      'ignore',
+      '',
+    ].join('\n');
+    gistVersion = 'gist-v1';
 
     const mock = createMockServer([
       {
@@ -1362,6 +1380,24 @@ describe('pull: repo sources', () => {
         path: /^\/repos\/acme\/widgets\/compare\//,
         handler: (_req, res) => jsonResponse(res, { files: compareFiles ?? [] }),
       },
+      {
+        method: 'GET',
+        path: /^\/gists\/abc123def456789012345(?:\/gist-v1|\/gist-v2)?$/,
+        handler: (req, res) => {
+          const version = (req.url || '').split('/').pop();
+          const content = version === 'gist-v1'
+            ? gistContent.replace('gist install v2', 'gist install v1')
+            : gistContent;
+          jsonResponse(res, {
+            id: 'abc123def456789012345',
+            description: 'agent rules',
+            files: {
+              'AGENTS.md': { filename: 'AGENTS.md', content },
+            },
+            history: [{ version: gistVersion }],
+          });
+        },
+      },
     ]);
     githubApiUrl = await mock.start();
     mockServer = mock.server;
@@ -1409,6 +1445,140 @@ describe('pull: repo sources', () => {
     const pull = await run('pull', dir, githubEnv());
     expect(pull.code).toBe(0);
     expect(readFileSync(join(dir, 'notes/AGENTS.md'), 'utf-8')).toBe('hello v2\n');
+  });
+
+  it('tracks a markdown heading into a local markdown heading', async () => {
+    fileContent = [
+      '# Upstream',
+      '',
+      '## Installation',
+      '',
+      'install v1',
+      '',
+      '### Details',
+      '',
+      'nested v1',
+      '',
+      '## Other',
+      '',
+      'ignore me',
+      '',
+    ].join('\n');
+    writeFileSync(join(dir, 'AGENTS.md'), [
+      '# Agent Guide',
+      '',
+      '## Instructions',
+      '',
+      'old local placeholder',
+      '',
+      '## Local Notes',
+      '',
+      'keep me',
+      '',
+    ].join('\n'));
+
+    const add = await run('add https://github.com/acme/widgets/blob/main/docs/AGENTS.md##Installation ./AGENTS.md##Instructions', dir, githubEnv());
+    expect(add.code).toBe(0);
+    expect(readFileSync(join(dir, 'AGENTS.md'), 'utf-8')).toBe([
+      '# Agent Guide',
+      '',
+      '## Instructions',
+      '',
+      'install v1',
+      '',
+      '### Details',
+      '',
+      'nested v1',
+      '## Local Notes',
+      '',
+      'keep me',
+      '',
+    ].join('\n'));
+
+    const manifest = JSON.parse(readFileSync(join(dir, 'trackcn.json'), 'utf-8'));
+    expect(manifest.sources[0].url).toBe('https://github.com/acme/widgets/tree/main/docs/AGENTS.md##installation');
+    expect(manifest.sources[0].files['AGENTS.md##instructions']).toBeDefined();
+
+    fileContent = fileContent.replace('install v1', 'install v2').replace('nested v1', 'nested v2');
+    headSha = 'sha-v2';
+
+    const pull = await run('pull', dir, githubEnv());
+    expect(pull.code).toBe(0);
+    expect(readFileSync(join(dir, 'AGENTS.md'), 'utf-8')).toContain('install v2');
+    expect(readFileSync(join(dir, 'AGENTS.md'), 'utf-8')).toContain('nested v2');
+    expect(readFileSync(join(dir, 'AGENTS.md'), 'utf-8')).toContain('## Local Notes\n\nkeep me');
+  });
+
+  it('tracks a gist markdown heading into a local markdown heading', async () => {
+    writeFileSync(join(dir, 'AGENTS.md'), [
+      '# Agent Guide',
+      '',
+      '## Instructions',
+      '',
+      'old',
+      '',
+      '## Local Notes',
+      '',
+      'keep me',
+      '',
+    ].join('\n'));
+
+    const add = await run('add https://gist.github.com/user/abc123def456789012345##Installation ./AGENTS.md##Instructions', dir, githubEnv());
+    expect(add.code).toBe(0);
+    expect(readFileSync(join(dir, 'AGENTS.md'), 'utf-8')).toContain('## Instructions\n\ngist install v1\n## Local Notes');
+
+    const manifest = JSON.parse(readFileSync(join(dir, 'trackcn.json'), 'utf-8'));
+    expect(manifest.sources[0].url).toBe('https://gist.github.com/abc123def456789012345##installation');
+    expect(manifest.sources[0].files['AGENTS.md##instructions']).toBeDefined();
+
+    gistContent = gistContent.replace('gist install v1', 'gist install v2');
+    gistVersion = 'gist-v2';
+
+    const pull = await run('pull', dir, githubEnv());
+    expect(pull.code).toBe(0);
+    const onDisk = readFileSync(join(dir, 'AGENTS.md'), 'utf-8');
+    expect(onDisk).toContain('## Instructions\n\ngist install v2\n## Local Notes');
+    expect(onDisk).toContain('keep me');
+  });
+
+  it('pulls a whole single-file gist into a local markdown heading', async () => {
+    gistContent = [
+      'gist install v1',
+      '',
+      '- use codex',
+      '',
+    ].join('\n');
+
+    writeFileSync(join(dir, 'CLAUDE.md'), [
+      '## Model Routing',
+      '',
+      'old',
+      '',
+      '## Local Notes',
+      '',
+      'keep me',
+      '',
+    ].join('\n'));
+
+    const add = await run('add https://gist.github.com/user/abc123def456789012345 ./CLAUDE.md##model-routing', dir, githubEnv());
+    expect(add.code).toBe(0);
+    expect(readFileSync(join(dir, 'CLAUDE.md'), 'utf-8')).toContain('gist install v1');
+
+    gistContent = gistContent.replace('gist install v1', 'gist install v2');
+    gistVersion = 'gist-v2';
+
+    const status = await run('status', dir, githubEnv());
+    expect(status.code).toBe(1);
+    expect(status.stdout).toContain('gist:abc123d -> CLAUDE.md##model-routing');
+    expect(status.stdout).toContain('M CLAUDE.md##model-routing');
+    expect(status.stdout).not.toContain('A AGENTS.md');
+
+    const pull = await run('pull', dir, githubEnv());
+    expect(pull.code).toBe(0);
+    const onDisk = readFileSync(join(dir, 'CLAUDE.md'), 'utf-8');
+    expect(onDisk).toContain('gist install v2');
+    expect(onDisk).toContain('## Local Notes\n\nkeep me');
+    expect(existsSync(join(dir, 'AGENTS.md'))).toBe(false);
   });
 
   it('treats a target with an extension as a file path (rename) and keeps it across pulls', async () => {
